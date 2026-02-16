@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default permissions for Rain terminal","local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:event:allow-emit","core:event:allow-listen","core:window:allow-start-dragging"]}}
