@@ -3,7 +3,11 @@
 
 const encoder = new TextEncoder();
 
-export function keyEventToBytes(e: KeyboardEvent, optionAsMeta: boolean = true): Uint8Array {
+export function keyEventToBytes(
+  e: KeyboardEvent,
+  optionAsMeta: boolean = true,
+  cursorKeysApplication: boolean = false,
+): Uint8Array {
   // Cmd+C / Cmd+V should be handled by the OS, not sent to terminal
   if (e.metaKey && (e.key === "c" || e.key === "v" || e.key === "a" || e.key === "x")) {
     return new Uint8Array([]);
@@ -49,6 +53,8 @@ export function keyEventToBytes(e: KeyboardEvent, optionAsMeta: boolean = true):
       if (e.shiftKey) return new Uint8Array([0x0a]);
       return new Uint8Array([0x0d]);
     case "Tab":
+      // Ctrl+Tab is used for tab switching, don't send to terminal
+      if (e.ctrlKey) return new Uint8Array([]);
       return e.shiftKey
         ? new Uint8Array([0x1b, 0x5b, 0x5a]) // ESC[Z (back-tab)
         : new Uint8Array([0x09]);
@@ -59,15 +65,15 @@ export function keyEventToBytes(e: KeyboardEvent, optionAsMeta: boolean = true):
     case "Delete":
       return new Uint8Array([0x1b, 0x5b, 0x33, 0x7e]); // ESC[3~
 
-    // Arrow keys
+    // Arrow keys: use SS3 (ESC O) in application mode (DECCKM), CSI (ESC [) otherwise
     case "ArrowUp":
-      return modifiedKey(e, 0x41);
+      return modifiedKey(e, 0x41, cursorKeysApplication);
     case "ArrowDown":
-      return modifiedKey(e, 0x42);
+      return modifiedKey(e, 0x42, cursorKeysApplication);
     case "ArrowRight":
-      return modifiedKey(e, 0x43);
+      return modifiedKey(e, 0x43, cursorKeysApplication);
     case "ArrowLeft":
-      return modifiedKey(e, 0x44);
+      return modifiedKey(e, 0x44, cursorKeysApplication);
 
     // Navigation
     case "Home":
@@ -116,11 +122,13 @@ export function keyEventToBytes(e: KeyboardEvent, optionAsMeta: boolean = true):
   }
 }
 
-// Build a modified arrow/cursor key sequence with shift/alt/ctrl modifiers
-function modifiedKey(e: KeyboardEvent, finalByte: number): Uint8Array {
+// Build a modified arrow/cursor key sequence with shift/alt/ctrl modifiers.
+// When DECCKM (cursor keys application mode) is active and no modifiers are
+// held, arrow keys use SS3 (ESC O) instead of CSI (ESC [).
+function modifiedKey(e: KeyboardEvent, finalByte: number, applicationMode: boolean = false): Uint8Array {
   const mod_ = modifierCode(e);
   if (mod_ > 1) {
-    // ESC[1;<mod><final>
+    // ESC[1;<mod><final> (modifiers always use CSI form)
     const modStr = mod_.toString();
     const bytes = [0x1b, 0x5b, 0x31, 0x3b];
     for (const ch of modStr) {
@@ -129,7 +137,9 @@ function modifiedKey(e: KeyboardEvent, finalByte: number): Uint8Array {
     bytes.push(finalByte);
     return new Uint8Array(bytes);
   }
-  return new Uint8Array([0x1b, 0x5b, finalByte]);
+  // Application mode: ESC O <final>; Normal mode: ESC [ <final>
+  const introducer = applicationMode ? 0x4f : 0x5b;
+  return new Uint8Array([0x1b, introducer, finalByte]);
 }
 
 function modifierCode(e: KeyboardEvent): number {

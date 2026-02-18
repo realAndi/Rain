@@ -217,3 +217,13 @@ export const IconMoon: Component<{ size?: number }> = (props) => {
     </svg>
   );
 };
+
+export const IconUser: Component<{ size?: number }> = (props) => {
+  const s = () => props.size ?? 14;
+  return (
+    <svg {...iconProps} width={s()} height={s()} viewBox="0 0 24 24">
+      <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" />
+      <circle cx="12" cy="7" r="4" />
+    </svg>
+  );
+};

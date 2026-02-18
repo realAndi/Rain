@@ -2,6 +2,8 @@ import { Component, For, Show, createMemo } from "solid-js";
 import type { RenderedLine, StyledSpan, SerializableColor, SearchMatch } from "../lib/types";
 import type { SelectionRange } from "../lib/selection";
 import { normalizeRange, isCellSelected } from "../lib/selection";
+import { useTheme, THEME_ANSI_PALETTES } from "../stores/theme";
+import { colorToCSS } from "../lib/color";
 
 // URL detection regex
 const URL_REGEX = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/g;
@@ -54,10 +56,13 @@ interface SpanElementProps {
 }
 
 const SpanElement: Component<SpanElementProps> = (props) => {
+  const { theme } = useTheme();
+  const ansiPalette = createMemo(() => THEME_ANSI_PALETTES[theme()] ?? THEME_ANSI_PALETTES["dark"]);
+
   const style = () => {
     const s: Record<string, string> = { opacity: "1" };
-    const fg = colorToCSS(props.span.fg, true);
-    const bg = colorToCSS(props.span.bg, false);
+    const fg = colorToCSS(props.span.fg, ansiPalette());
+    const bg = colorToCSS(props.span.bg, ansiPalette());
 
     if (fg) s.color = fg;
     if (bg) s["background-color"] = bg;
@@ -264,51 +269,3 @@ const UrlSpan: Component<{
   );
 };
 
-// ANSI 16-color palette (Tokyo Night)
-const ANSI_COLORS = [
-  "#15161e", // 0 black
-  "#f7768e", // 1 red
-  "#9ece6a", // 2 green
-  "#e0af68", // 3 yellow
-  "#7aa2f7", // 4 blue
-  "#bb9af7", // 5 magenta
-  "#7dcfff", // 6 cyan
-  "#a9b1d6", // 7 white
-  "#414868", // 8 bright black
-  "#ff9e9e", // 9 bright red
-  "#b9f27c", // 10 bright green
-  "#ff9e64", // 11 bright yellow
-  "#82aaff", // 12 bright blue
-  "#d4b0ff", // 13 bright magenta
-  "#a9e1ff", // 14 bright cyan
-  "#c0caf5", // 15 bright white
-];
-
-function colorToCSS(color: SerializableColor, isForeground: boolean): string | null {
-  switch (color.type) {
-    case "Default":
-      return null; // use CSS variable default
-    case "Indexed": {
-      const idx = color.index;
-      if (idx < 16) {
-        return ANSI_COLORS[idx];
-      }
-      if (idx < 232) {
-        // 6x6x6 color cube
-        const i = idx - 16;
-        const r = Math.floor(i / 36);
-        const g = Math.floor((i % 36) / 6);
-        const b = i % 6;
-        const toVal = (v: number) => (v === 0 ? 0 : 55 + 40 * v);
-        return `rgb(${toVal(r)},${toVal(g)},${toVal(b)})`;
-      }
-      // Grayscale ramp
-      const v = 8 + 10 * (idx - 232);
-      return `rgb(${v},${v},${v})`;
-    }
-    case "Rgb":
-      return `rgb(${color.r},${color.g},${color.b})`;
-    default:
-      return null;
-  }
-}

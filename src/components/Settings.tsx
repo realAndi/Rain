@@ -8,249 +8,65 @@ import {
   onCleanup,
 } from "solid-js";
 import { Portal } from "solid-js/web";
-import { useConfig } from "../stores/config";
+import { useConfig, type MacosGlassEngine } from "../stores/config";
 import { useTheme, THEME_LIST } from "../stores/theme";
 import {
   computeBlurProfile,
 } from "../lib/glass";
-import { setAppIcon } from "../lib/ipc";
+import { setAppIcon, saveTextToFile } from "../lib/ipc";
+import {
+  LIQUID_GLASS_VARIANTS,
+  isLiquidGlassSupported,
+} from "../lib/liquidGlass";
 import {
   IconPalette,
   IconTerminal,
   IconKeyboard,
   IconCheck,
+  IconUser,
 } from "./icons";
+import {
+  getProfiles,
+  addProfile,
+  updateProfile,
+  deleteProfile,
+  getActiveProfileId,
+  setActiveProfileId,
+  type ShellProfile,
+} from "../lib/profiles";
+import {
+  getTriggers,
+  addTrigger,
+  updateTrigger,
+  deleteTrigger,
+  type OutputTrigger,
+} from "../lib/triggers";
+import { HslColorPicker } from "./HslColorPicker";
+import { showToast } from "./Toast";
 
-type Section = "appearance" | "terminal" | "shortcuts";
+type Section = "appearance" | "terminal" | "shortcuts" | "profiles";
 
-// ---- HSL <-> Hex conversion utilities ----
-
-function hslToHex(h: number, s: number, l: number): string {
-  const sN = s / 100;
-  const lN = l / 100;
-  const a = sN * Math.min(lN, 1 - lN);
-  const f = (n: number) => {
-    const k = (n + h / 30) % 12;
-    const color = lN - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
-    return Math.round(255 * Math.max(0, Math.min(1, color)))
-      .toString(16)
-      .padStart(2, "0");
-  };
-  return `#${f(0)}${f(8)}${f(4)}`;
-}
-
-function hexToHsl(hex: string): [number, number, number] {
-  const r = parseInt(hex.slice(1, 3), 16) / 255;
-  const g = parseInt(hex.slice(3, 5), 16) / 255;
-  const b = parseInt(hex.slice(5, 7), 16) / 255;
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const l = (max + min) / 2;
-  if (max === min) return [0, 0, Math.round(l * 100)];
-  const d = max - min;
-  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h = 0;
-  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
-  else if (max === g) h = ((b - r) / d + 2) / 6;
-  else h = ((r - g) / d + 4) / 6;
-  return [Math.round(h * 360), Math.round(s * 100), Math.round(l * 100)];
-}
-
-function isValidHex(v: string): boolean {
-  return /^#[0-9a-fA-F]{6}$/.test(v);
-}
-
-// ---- HSL Color Picker ----
-
-const HslColorPicker: Component<{
+const MACOS_GLASS_ENGINES: ReadonlyArray<{
+  value: MacosGlassEngine;
   label: string;
-  value: string | null;
-  defaultColor: string;
-  onChange: (color: string | null) => void;
-  pickerId: string;
-  openPickerId: () => string | null;
-  setOpenPickerId: (id: string | null) => void;
-}> = (props) => {
-  let wrapRef: HTMLDivElement | undefined;
-  const displayColor = () => props.value ?? props.defaultColor;
-  const open = () => props.openPickerId() === props.pickerId;
-  const setOpen = (v: boolean) => props.setOpenPickerId(v ? props.pickerId : null);
-  const [hue, setHue] = createSignal(0);
-  const [sat, setSat] = createSignal(100);
-  const [lit, setLit] = createSignal(50);
-  const [hexInput, setHexInput] = createSignal("");
-
-  // Close picker when clicking outside
-  function handleClickOutside(e: MouseEvent) {
-    if (open() && wrapRef && !wrapRef.contains(e.target as Node)) {
-      setOpen(false);
-    }
-  }
-
-  createEffect(() => {
-    if (open()) {
-      document.addEventListener("pointerdown", handleClickOutside);
-    } else {
-      document.removeEventListener("pointerdown", handleClickOutside);
-    }
-  });
-
-  onCleanup(() => {
-    document.removeEventListener("pointerdown", handleClickOutside);
-  });
-
-  // Sync internal HSL state when the external value changes
-  createEffect(() => {
-    const color = displayColor();
-    if (isValidHex(color)) {
-      const [h, s, l] = hexToHsl(color);
-      setHue(h);
-      setSat(s);
-      setLit(l);
-      setHexInput(color.toUpperCase());
-    }
-  });
-
-  function emitColor(h: number, s: number, l: number) {
-    const hex = hslToHex(h, s, l);
-    setHexInput(hex.toUpperCase());
-    props.onChange(hex);
-  }
-
-  // Saturation/Lightness area drag
-  function handleSLPointerDown(e: PointerEvent) {
-    const el = e.currentTarget as HTMLElement;
-    el.setPointerCapture(e.pointerId);
-    updateSL(e, el);
-  }
-
-  function handleSLPointerMove(e: PointerEvent) {
-    const el = e.currentTarget as HTMLElement;
-    if (el.hasPointerCapture(e.pointerId)) {
-      updateSL(e, el);
-    }
-  }
-
-  function updateSL(e: PointerEvent, el: HTMLElement) {
-    const rect = el.getBoundingClientRect();
-    const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-    const s = Math.round(x * 100);
-    const l = Math.round((1 - y) * 100);
-    setSat(s);
-    setLit(l);
-    emitColor(hue(), s, l);
-  }
-
-  // Hue strip drag
-  function handleHuePointerDown(e: PointerEvent) {
-    const el = e.currentTarget as HTMLElement;
-    el.setPointerCapture(e.pointerId);
-    updateHue(e, el);
-  }
-
-  function handleHuePointerMove(e: PointerEvent) {
-    const el = e.currentTarget as HTMLElement;
-    if (el.hasPointerCapture(e.pointerId)) {
-      updateHue(e, el);
-    }
-  }
-
-  function updateHue(e: PointerEvent, el: HTMLElement) {
-    const rect = el.getBoundingClientRect();
-    const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const h = Math.round(x * 360);
-    setHue(h);
-    emitColor(h, sat(), lit());
-  }
-
-  function handleHexInput(value: string) {
-    setHexInput(value);
-    const v = value.startsWith("#") ? value : `#${value}`;
-    if (isValidHex(v)) {
-      const [h, s, l] = hexToHsl(v);
-      setHue(h);
-      setSat(s);
-      setLit(l);
-      props.onChange(v);
-    }
-  }
-
-  return (
-    <div class="hsl-picker-wrap" ref={wrapRef}>
-      <div class="settings-color-row">
-        <button
-          class="settings-color-swatch"
-          style={{ background: displayColor() }}
-          onClick={() => setOpen(!open())}
-          title="Pick color"
-        />
-        <span class="settings-color-hex">
-          {props.value ? props.value.toUpperCase() : "Default"}
-        </span>
-        <Show when={props.value !== null}>
-          <button
-            class="settings-color-reset"
-            onClick={() => {
-              props.onChange(null);
-              setOpen(false);
-            }}
-            title="Reset to theme default"
-          >
-            Reset
-          </button>
-        </Show>
-      </div>
-
-      <Show when={open()}>
-        <div class="hsl-picker">
-          {/* Saturation / Lightness area */}
-          <div
-            class="hsl-sl-area"
-            style={{
-              background: `linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, hsl(${hue()}, 100%, 50%))`,
-            }}
-            onPointerDown={handleSLPointerDown}
-            onPointerMove={handleSLPointerMove}
-          >
-            <div
-              class="hsl-sl-indicator"
-              style={{
-                left: `${sat()}%`,
-                top: `${100 - lit()}%`,
-                background: displayColor(),
-              }}
-            />
-          </div>
-
-          {/* Hue strip */}
-          <div
-            class="hsl-hue-strip"
-            onPointerDown={handleHuePointerDown}
-            onPointerMove={handleHuePointerMove}
-          >
-            <div
-              class="hsl-hue-indicator"
-              style={{
-                left: `${(hue() / 360) * 100}%`,
-              }}
-            />
-          </div>
-
-          {/* Hex input */}
-          <input
-            class="hsl-hex-input"
-            type="text"
-            value={hexInput()}
-            onInput={(e) => handleHexInput(e.currentTarget.value)}
-            spellcheck={false}
-            maxLength={7}
-          />
-        </div>
-      </Show>
-    </div>
-  );
-};
+  hint: string;
+}> = [
+  {
+    value: "liquid",
+    label: "Liquid",
+    hint: "Uses tauri-plugin-liquid-glass with native Liquid Glass on macOS 26+.",
+  },
+  {
+    value: "cgs",
+    label: "CGS",
+    hint: "Uses Rain's current private CoreGraphics blur radius path.",
+  },
+  {
+    value: "cssSafe",
+    label: "CSS Safe",
+    hint: "Uses web CSS backdrop blur only (no native private effect view).",
+  },
+];
 
 // ---- Font Family Dropdown ----
 
@@ -513,21 +329,119 @@ const NAV_SECTIONS: { id: Section; label: string; icon: () => any }[] = [
   { id: "appearance", label: "Appearance", icon: () => <IconPalette size={14} /> },
   { id: "terminal", label: "Terminal", icon: () => <IconTerminal size={14} /> },
   { id: "shortcuts", label: "Shortcuts", icon: () => <IconKeyboard size={14} /> },
+  { id: "profiles", label: "Profiles", icon: () => <IconUser size={14} /> },
 ];
 
 // ---- Settings Component ----
 
 export const Settings: Component = () => {
-  const { config, updateConfig, saveConfig, isDirty } = useConfig();
+  const { config, updateConfig, saveConfig, isDirty, resetSection } = useConfig();
   const { theme, setTheme } = useTheme();
   const [activeSection, setActiveSection] = createSignal<Section>("appearance");
   const [openPickerId, setOpenPickerId] = createSignal<string | null>(null);
   const [saved, setSaved] = createSignal(false);
+  const [profileList, setProfileList] = createSignal<ShellProfile[]>(getProfiles());
+  const [selectedProfileId, setSelectedProfileId] = createSignal(getActiveProfileId());
+  const [profileEnvDraft, setProfileEnvDraft] = createSignal("");
+  const [triggerList, setTriggerList] = createSignal<OutputTrigger[]>(getTriggers());
+  const [nativeLiquidSupported, setNativeLiquidSupported] = createSignal<boolean | null>(null);
+  const isMac = typeof navigator !== "undefined" && navigator.userAgent.includes("Mac");
+
+  function formatEnvMap(env?: Record<string, string>): string {
+    if (!env || Object.keys(env).length === 0) return "";
+    return Object.entries(env)
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n");
+  }
+
+  function parseEnvDraft(text: string): Record<string, string> | undefined {
+    const map: Record<string, string> = {};
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const sep = line.indexOf("=");
+      if (sep <= 0) continue;
+      const key = line.slice(0, sep).trim();
+      const value = line.slice(sep + 1).trim();
+      if (!key) continue;
+      map[key] = value;
+    }
+    return Object.keys(map).length > 0 ? map : undefined;
+  }
+
+  function refreshProfiles(preferredProfileId?: string) {
+    const nextProfiles = getProfiles();
+    setProfileList(nextProfiles);
+    const fallbackId = nextProfiles.find((profile) => profile.id === preferredProfileId)
+      ? preferredProfileId!
+      : nextProfiles.find((profile) => profile.id === selectedProfileId())?.id ??
+        nextProfiles[0]?.id ??
+        "default";
+    setSelectedProfileId(fallbackId);
+    setActiveProfileId(fallbackId);
+  }
+
+  const selectedProfile = () =>
+    profileList().find((profile) => profile.id === selectedProfileId()) ?? profileList()[0];
+
+  createEffect(() => {
+    const current = selectedProfile();
+    if (!current) return;
+    if (current.id !== selectedProfileId()) {
+      setSelectedProfileId(current.id);
+    }
+    setActiveProfileId(current.id);
+    setProfileEnvDraft(formatEnvMap(current.env));
+  });
+
+  let fileInputRef: HTMLInputElement | undefined;
 
   function handleSave() {
     saveConfig();
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
+  }
+
+  async function handleExportConfig() {
+    try {
+      const json = JSON.stringify(config(), null, 2);
+      const saved = await saveTextToFile(json, "rain-config.json");
+      if (saved) showToast("Config exported successfully", "success");
+    } catch (e) {
+      console.error(e);
+      showToast("Failed to export config", "error");
+    }
+  }
+
+  function handleImportConfig() {
+    fileInputRef?.click();
+  }
+
+  function handleFileSelected(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result as string);
+        if (typeof parsed !== "object" || parsed === null) {
+          showToast("Invalid config file format", "error");
+          return;
+        }
+        updateConfig(parsed);
+        saveConfig();
+        showToast("Config imported successfully", "success");
+      } catch {
+        showToast("Failed to parse config file", "error");
+      }
+      input.value = "";
+    };
+    reader.onerror = () => {
+      showToast("Failed to read config file", "error");
+      input.value = "";
+    };
+    reader.readAsText(file);
   }
 
   // Cmd+S saves settings
@@ -540,6 +454,14 @@ export const Settings: Component = () => {
 
   onMount(() => {
     document.addEventListener("keydown", handleKeyDown);
+    if (isMac) {
+      isLiquidGlassSupported()
+        .then((supported) => setNativeLiquidSupported(supported))
+        .catch((error) => {
+          console.warn("[Rain] Failed to check native Liquid Glass support:", error);
+          setNativeLiquidSupported(false);
+        });
+    }
   });
 
   onCleanup(() => {
@@ -587,10 +509,10 @@ export const Settings: Component = () => {
   }
 
   return (
-    <div class="settings-page">
+    <div class="settings-page" role="dialog" aria-label="Settings">
       <div class="settings-layout">
         {/* Sidebar */}
-        <nav class="settings-sidebar">
+        <nav class="settings-sidebar" role="navigation" aria-label="Settings sections">
           <div class="settings-sidebar-heading">Settings</div>
           <For each={NAV_SECTIONS}>
             {(section) => (
@@ -649,36 +571,18 @@ export const Settings: Component = () => {
               <h3 class="settings-card-title">App Icon</h3>
               <div class="settings-field">
                 <label class="settings-label">Dock icon style</label>
-                <div class="settings-cursor-options">
-                  <button
-                    class={`settings-cursor-option ${config().appIcon === "default" ? "settings-cursor-option-active" : ""}`}
-                    onClick={() => {
-                      updateConfig({ appIcon: "default" });
-                      setAppIcon("default").catch(console.warn);
-                    }}
-                  >
-                    <div class="cursor-preview icon-preview" style={{ background: "linear-gradient(135deg, #4a6a8a, #6a8aaa)", "border-radius": "8px" }}>
-                      <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                        <path d="M10 3C10 3 8 8 8 12C8 14.2 8.9 16 10 16C11.1 16 12 14.2 12 12C12 8 10 3 10 3Z" fill="rgba(255,255,255,0.9)" />
-                      </svg>
-                    </div>
-                    <span>Default</span>
-                  </button>
-                  <button
-                    class={`settings-cursor-option ${config().appIcon === "simple" ? "settings-cursor-option-active" : ""}`}
-                    onClick={() => {
-                      updateConfig({ appIcon: "simple" });
-                      setAppIcon("simple").catch(console.warn);
-                    }}
-                  >
-                    <div class="cursor-preview icon-preview" style={{ background: "#1a1a2e", "border-radius": "8px" }}>
-                      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                        <path d="M8 2C8 2 6.5 6 6.5 9.5C6.5 11.4 7.2 13 8 13C8.8 13 9.5 11.4 9.5 9.5C9.5 6 8 2 8 2Z" fill="rgba(255,255,255,0.7)" />
-                      </svg>
-                    </div>
-                    <span>Simple</span>
-                  </button>
-                </div>
+                <select
+                  class="settings-input"
+                  value={config().appIcon}
+                  onChange={(e) => {
+                    const icon = e.currentTarget.value as "default" | "simple";
+                    updateConfig({ appIcon: icon });
+                    setAppIcon(icon).catch(console.warn);
+                  }}
+                >
+                  <option value="default">Default</option>
+                  <option value="simple">Simple</option>
+                </select>
               </div>
             </div>
 
@@ -729,6 +633,113 @@ export const Settings: Component = () => {
                   </span>
                 </div>
               </div>
+
+              <Show when={isMac}>
+                <div class="settings-field">
+                  <label class="settings-label">macOS Glass Engine</label>
+                  <select
+                    class="settings-input"
+                    value={config().macosGlassEngine}
+                    onChange={(e) => {
+                      updateConfig({
+                        macosGlassEngine: e.currentTarget.value as MacosGlassEngine,
+                      });
+                    }}
+                  >
+                    <For each={MACOS_GLASS_ENGINES}>
+                      {(option) => (
+                        <option value={option.value}>
+                          {option.label}
+                        </option>
+                      )}
+                    </For>
+                  </select>
+                  <Show when={MACOS_GLASS_ENGINES.find((option) => option.value === config().macosGlassEngine)}>
+                    {(entry) => (
+                      <p class="settings-hint">{entry().hint}</p>
+                    )}
+                  </Show>
+                  <Show when={config().macosGlassEngine === "liquid" && nativeLiquidSupported() === false}>
+                    <p class="settings-hint">
+                      Native Liquid Glass is unavailable on this macOS version. The plugin
+                      will use vibrancy fallback, and Rain automatically falls back to CGS if
+                      plugin calls fail.
+                    </p>
+                  </Show>
+                  <Show when={config().macosGlassEngine === "cssSafe"}>
+                    <p class="settings-hint">
+                      CSS Safe mode avoids native private effect views and relies on web blur.
+                    </p>
+                  </Show>
+                </div>
+
+                <Show when={config().macosGlassEngine === "liquid"}>
+                  <div class="settings-field">
+                    <label class="settings-label">Liquid Variant</label>
+                    <select
+                      class="settings-input"
+                      value={String(config().liquidVariant)}
+                      onChange={(e) => {
+                        const next = Number.parseInt(e.currentTarget.value, 10);
+                        if (!Number.isNaN(next)) {
+                          updateConfig({ liquidVariant: next });
+                        }
+                      }}
+                    >
+                      <For each={LIQUID_GLASS_VARIANTS}>
+                        {(variant) => (
+                          <option value={String(variant.value)}>
+                            {variant.label}
+                          </option>
+                        )}
+                      </For>
+                    </select>
+                    <p class="settings-hint">
+                      Material variants are only applied when native Liquid Glass is available.
+                    </p>
+                  </div>
+
+                  <div class="settings-field">
+                    <label class="settings-label">Liquid Corner Radius</label>
+                    <div class="settings-range-row">
+                      <input
+                        class="settings-range-input"
+                        type="range"
+                        min="0"
+                        max="64"
+                        step="1"
+                        value={config().liquidCornerRadius}
+                        onInput={(e) => {
+                          const next = Number.parseInt(e.currentTarget.value, 10);
+                          if (!Number.isNaN(next)) {
+                            updateConfig({ liquidCornerRadius: next });
+                          }
+                        }}
+                      />
+                      <span class="settings-range-value">
+                        {config().liquidCornerRadius}px
+                      </span>
+                    </div>
+                  </div>
+
+                  <div class="settings-field">
+                    <label class="settings-label">Liquid Tint Color</label>
+                    <input
+                      class="settings-input"
+                      type="text"
+                      placeholder="#FFFFFF20"
+                      value={config().liquidTintColor ?? ""}
+                      onChange={(e) => {
+                        const value = e.currentTarget.value.trim();
+                        updateConfig({ liquidTintColor: value.length > 0 ? value : null });
+                      }}
+                    />
+                    <p class="settings-hint">
+                      Optional hex tint (`#RRGGBB` or `#RRGGBBAA`). Leave empty to disable tint.
+                    </p>
+                  </div>
+                </Show>
+              </Show>
             </div>
 
             {/* Colors */}
@@ -1025,6 +1036,15 @@ export const Settings: Component = () => {
                 </div>
               </div>
             </div>
+
+            {/* Reset Appearance */}
+            <div class="settings-card settings-reset-card">
+              <button class="settings-reset-btn" onClick={() => {
+                if (window.confirm("Reset all appearance settings to defaults?")) resetSection("appearance");
+              }}>
+                Reset Appearance to Defaults
+              </button>
+            </div>
           </Show>
 
           {/* ---- TERMINAL ---- */}
@@ -1051,6 +1071,38 @@ export const Settings: Component = () => {
                       &gt;_
                     </div>
                     <span>Traditional</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-card">
+              <h3 class="settings-card-title">tmux Integration</h3>
+              <div class="settings-field">
+                <label class="settings-label">tmux handling mode</label>
+                <p class="settings-hint">
+                  Integrated mode intercepts <code>tmux</code> and renders panes
+                  through tmux control mode (<code>-CC</code>). Native mode runs
+                  tmux directly inside the terminal.
+                </p>
+                <div class="settings-cursor-options">
+                  <button
+                    class={`settings-cursor-option ${config().tmuxMode === "integrated" ? "settings-cursor-option-active" : ""}`}
+                    onClick={() => updateConfig({ tmuxMode: "integrated" })}
+                  >
+                    <div class="cursor-preview" style={{ "font-size": "9px", "align-items": "center", "justify-content": "center" }}>
+                      -CC
+                    </div>
+                    <span>Integrated</span>
+                  </button>
+                  <button
+                    class={`settings-cursor-option ${config().tmuxMode === "native" ? "settings-cursor-option-active" : ""}`}
+                    onClick={() => updateConfig({ tmuxMode: "native" })}
+                  >
+                    <div class="cursor-preview" style={{ "font-size": "9px", "align-items": "center", "justify-content": "center" }}>
+                      tmux
+                    </div>
+                    <span>Native</span>
                   </button>
                 </div>
               </div>
@@ -1183,6 +1235,23 @@ export const Settings: Component = () => {
                 </button>
               </div>
 
+              <div class="settings-field settings-field-row">
+                <div class="settings-field-info">
+                  <label class="settings-label">Enable Ligatures</label>
+                  <p class="settings-hint">
+                    Render coding ligatures for fonts that support them.
+                  </p>
+                </div>
+                <button
+                  class={`settings-toggle ${config().enableLigatures ? "settings-toggle-on" : ""}`}
+                  onClick={() =>
+                    updateConfig({ enableLigatures: !config().enableLigatures })
+                  }
+                >
+                  <span class="settings-toggle-knob" />
+                </button>
+              </div>
+
               <div class="settings-field">
                 <label class="settings-label">Scrollback Lines</label>
                 <p class="settings-hint">
@@ -1205,6 +1274,36 @@ export const Settings: Component = () => {
                     }}
                   />
                   <span class="settings-number-unit">lines</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-card">
+              <h3 class="settings-card-title">Renderer</h3>
+              <div class="settings-field">
+                <label class="settings-label">Preferred Renderer</label>
+                <p class="settings-hint">
+                  DOM is the stable default. Canvas mode is experimental and used for inactive pane previews.
+                </p>
+                <div class="settings-cursor-options">
+                  <button
+                    class={`settings-cursor-option ${config().renderer === "dom" ? "settings-cursor-option-active" : ""}`}
+                    onClick={() => updateConfig({ renderer: "dom" })}
+                  >
+                    <div class="cursor-preview" style={{ "font-size": "9px", "align-items": "center", "justify-content": "center" }}>
+                      DOM
+                    </div>
+                    <span>DOM</span>
+                  </button>
+                  <button
+                    class={`settings-cursor-option ${config().renderer === "canvas" ? "settings-cursor-option-active" : ""}`}
+                    onClick={() => updateConfig({ renderer: "canvas" })}
+                  >
+                    <div class="cursor-preview" style={{ "font-size": "9px", "align-items": "center", "justify-content": "center" }}>
+                      Canvas
+                    </div>
+                    <span>Canvas</span>
+                  </button>
                 </div>
               </div>
             </div>
@@ -1302,6 +1401,100 @@ export const Settings: Component = () => {
                 </div>
               </div>
             </div>
+
+            <div class="settings-card">
+              <h3 class="settings-card-title">Output Triggers</h3>
+              <p class="settings-hint">
+                Match terminal output with regex and run an action.
+              </p>
+              <div style={{ display: "flex", "flex-direction": "column", gap: "10px" }}>
+                <For each={triggerList()}>
+                  {(trigger) => (
+                    <div style={{ display: "grid", "grid-template-columns": "1fr 1.3fr auto auto", gap: "8px", "align-items": "center" }}>
+                      <input
+                        class="settings-input"
+                        type="text"
+                        value={trigger.name}
+                        placeholder="Trigger name"
+                        onInput={(e) => {
+                          updateTrigger(trigger.id, { name: e.currentTarget.value });
+                          setTriggerList(getTriggers());
+                        }}
+                      />
+                      <input
+                        class="settings-input"
+                        type="text"
+                        value={trigger.pattern}
+                        placeholder="Regex pattern"
+                        onInput={(e) => {
+                          updateTrigger(trigger.id, { pattern: e.currentTarget.value });
+                          setTriggerList(getTriggers());
+                        }}
+                      />
+                      <select
+                        class="settings-input"
+                        value={trigger.action}
+                        onChange={(e) => {
+                          const action = e.currentTarget.value as OutputTrigger["action"];
+                          updateTrigger(trigger.id, { action });
+                          setTriggerList(getTriggers());
+                        }}
+                      >
+                        <option value="notify">Notify</option>
+                        <option value="sound">Sound</option>
+                        <option value="badge">Badge</option>
+                      </select>
+                      <button
+                        class={`settings-toggle ${trigger.enabled ? "settings-toggle-on" : ""}`}
+                        onClick={() => {
+                          updateTrigger(trigger.id, { enabled: !trigger.enabled });
+                          setTriggerList(getTriggers());
+                        }}
+                        title={trigger.enabled ? "Disable trigger" : "Enable trigger"}
+                      >
+                        <span class="settings-toggle-knob" />
+                      </button>
+                      <div style={{ "grid-column": "1 / span 4", display: "flex", "justify-content": "flex-end", gap: "8px" }}>
+                        <button
+                          class="settings-profile-delete"
+                          onClick={() => {
+                            deleteTrigger(trigger.id);
+                            setTriggerList(getTriggers());
+                          }}
+                          title="Delete trigger"
+                        >
+                          &times;
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </For>
+              </div>
+              <button
+                class="settings-btn"
+                style={{ margin: "12px 0 0" }}
+                onClick={() => {
+                  addTrigger({
+                    name: "New trigger",
+                    pattern: "",
+                    enabled: false,
+                    action: "notify",
+                  });
+                  setTriggerList(getTriggers());
+                }}
+              >
+                Add Trigger
+              </button>
+            </div>
+
+            {/* Reset Terminal */}
+            <div class="settings-card settings-reset-card">
+              <button class="settings-reset-btn" onClick={() => {
+                if (window.confirm("Reset all terminal settings to defaults?")) resetSection("terminal");
+              }}>
+                Reset Terminal to Defaults
+              </button>
+            </div>
           </Show>
 
           {/* ---- SHORTCUTS ---- */}
@@ -1322,6 +1515,201 @@ export const Settings: Component = () => {
                     </div>
                   )}
                 </For>
+              </div>
+            </div>
+
+            <div class="settings-card">
+              <h3 class="settings-card-title">Global Hotkey</h3>
+              <div class="settings-field">
+                <label class="settings-label">System-Wide Shortcut</label>
+                <p class="settings-hint">
+                  Example: <code>CmdOrCtrl+Shift+Space</code>. Leave empty to disable.
+                </p>
+                <input
+                  class="settings-input"
+                  type="text"
+                  value={config().globalHotkey ?? ""}
+                  placeholder="CmdOrCtrl+Shift+Space"
+                  onInput={(e) => {
+                    const value = e.currentTarget.value.trim();
+                    updateConfig({ globalHotkey: value.length > 0 ? value : null });
+                  }}
+                />
+              </div>
+            </div>
+          </Show>
+
+          {/* ---- DATA ---- */}
+          <div class="settings-card">
+            <h3 class="settings-card-title">Data</h3>
+            <p class="settings-hint">
+              Export your current configuration as a JSON file, or import a previously exported config.
+            </p>
+            <div style={{ display: "flex", gap: "8px" }}>
+              <button class="settings-btn" onClick={handleExportConfig}>
+                Export Config
+              </button>
+              <button class="settings-btn" onClick={handleImportConfig}>
+                Import Config
+              </button>
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              style={{ display: "none" }}
+              onChange={handleFileSelected}
+            />
+          </div>
+
+          {/* ---- PROFILES ---- */}
+          <Show when={activeSection() === "profiles"}>
+            <div class="settings-card settings-profiles-split">
+              {/* Left panel: profile list */}
+              <div class="settings-profiles-sidebar">
+                <h3 class="settings-card-title">Profiles</h3>
+
+                <div class="settings-profiles-list">
+                  <For each={profileList()}>
+                    {(profile) => (
+                      <div
+                        class={`settings-profile-item ${selectedProfileId() === profile.id ? "settings-profile-selected" : ""}`}
+                        onClick={() => {
+                          setSelectedProfileId(profile.id);
+                          setActiveProfileId(profile.id);
+                        }}
+                      >
+                        <div class="settings-profile-info">
+                          <div class="settings-profile-name-row">
+                            <span class="settings-profile-name">{profile.name}</span>
+                            <Show when={selectedProfileId() === profile.id}>
+                              <span class="settings-profile-active-badge">Active</span>
+                            </Show>
+                          </div>
+                          <span class="settings-profile-detail">
+                            {profile.shell ?? "Default shell"}
+                            {profile.cwd ? ` · ${profile.cwd}` : ""}
+                            {profile.env && Object.keys(profile.env).length > 0
+                              ? ` · ${Object.keys(profile.env).length} env`
+                              : ""}
+                          </span>
+                        </div>
+                        <Show when={profile.id !== "default"}>
+                          <button
+                            class="settings-profile-delete"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              deleteProfile(profile.id);
+                              refreshProfiles();
+                            }}
+                          >
+                            &times;
+                          </button>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                </div>
+
+                <button
+                  class="settings-btn"
+                  onClick={() => {
+                    const created = addProfile({ name: `Profile ${profileList().length}` });
+                    refreshProfiles(created.id);
+                  }}
+                >
+                  Add Profile
+                </button>
+              </div>
+
+              {/* Right panel: editor */}
+              <div class="settings-profiles-editor">
+                <Show
+                  when={selectedProfile()}
+                  fallback={
+                    <div class="settings-profiles-placeholder">
+                      <IconUser size={32} />
+                      <p>Select a profile to edit</p>
+                    </div>
+                  }
+                >
+                  {(profile) => (
+                    <>
+                      <h3 class="settings-card-title">
+                        {profile().id === "default" ? "Default Profile" : profile().name}
+                      </h3>
+
+                      <div class="settings-field">
+                        <label class="settings-label">Profile Name</label>
+                        <input
+                          class="settings-input"
+                          type="text"
+                          value={profile().name}
+                          onInput={(e) => {
+                            updateProfile(profile().id, { name: e.currentTarget.value });
+                            refreshProfiles(profile().id);
+                          }}
+                        />
+                      </div>
+
+                      <div class="settings-field">
+                        <label class="settings-label">Shell Path</label>
+                        <p class="settings-hint">
+                          Absolute path to the shell binary, e.g. <code>/bin/zsh</code>.
+                        </p>
+                        <input
+                          class="settings-input"
+                          type="text"
+                          value={profile().shell ?? ""}
+                          placeholder="Use system default shell"
+                          onInput={(e) => {
+                            const shell = e.currentTarget.value.trim();
+                            updateProfile(profile().id, { shell: shell || undefined });
+                            refreshProfiles(profile().id);
+                          }}
+                        />
+                      </div>
+
+                      <div class="settings-field">
+                        <label class="settings-label">Working Directory</label>
+                        <p class="settings-hint">
+                          Starting directory when a new tab is opened with this profile.
+                        </p>
+                        <input
+                          class="settings-input"
+                          type="text"
+                          value={profile().cwd ?? ""}
+                          placeholder="Use current pane directory"
+                          onInput={(e) => {
+                            const cwd = e.currentTarget.value.trim();
+                            updateProfile(profile().id, { cwd: cwd || undefined });
+                            refreshProfiles(profile().id);
+                          }}
+                        />
+                      </div>
+
+                      <div class="settings-field">
+                        <label class="settings-label">Environment Variables</label>
+                        <p class="settings-hint">
+                          One <code>KEY=VALUE</code> per line. Lines starting with <code>#</code> are ignored.
+                        </p>
+                        <textarea
+                          class="settings-input settings-textarea"
+                          value={profileEnvDraft()}
+                          placeholder={"FOO=bar\nAPI_URL=https://example.com"}
+                          onInput={(e) => {
+                            setProfileEnvDraft(e.currentTarget.value);
+                          }}
+                          onBlur={(e) => {
+                            const text = e.currentTarget.value;
+                            updateProfile(profile().id, { env: parseEnvDraft(text) });
+                            refreshProfiles(profile().id);
+                          }}
+                        />
+                      </div>
+                    </>
+                  )}
+                </Show>
               </div>
             </div>
           </Show>

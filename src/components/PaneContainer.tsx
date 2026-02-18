@@ -2,6 +2,9 @@ import { Component, Show, createSignal, onCleanup } from "solid-js";
 import type { PaneNode } from "../lib/types";
 import type { TerminalStore } from "../stores/terminal";
 import { Terminal } from "./Terminal";
+import { CanvasTerminal } from "./CanvasTerminal";
+import { useConfig } from "../stores/config";
+import { canUseCanvasRenderer } from "../lib/canvasRenderer";
 
 export interface PaneContainerProps {
   node: PaneNode;
@@ -9,6 +12,8 @@ export interface PaneContainerProps {
   activePaneId: string;
   onPaneActivate: (paneId: string) => void;
   onOpenSettings?: () => void;
+  onSplitRight?: (paneId: string) => void;
+  onSplitDown?: (paneId: string) => void;
   /** True when this container is inside a split (has sibling panes) */
   isSplit?: boolean;
 }
@@ -25,6 +30,8 @@ export const PaneContainer: Component<PaneContainerProps> = (props) => {
           isSplit={!!props.isSplit}
           onActivate={() => props.onPaneActivate(props.node.id)}
           onOpenSettings={props.onOpenSettings}
+          onSplitRight={() => props.onSplitRight?.(props.node.id)}
+          onSplitDown={() => props.onSplitDown?.(props.node.id)}
         />
       }
     >
@@ -34,6 +41,8 @@ export const PaneContainer: Component<PaneContainerProps> = (props) => {
         activePaneId={props.activePaneId}
         onPaneActivate={props.onPaneActivate}
         onOpenSettings={props.onOpenSettings}
+        onSplitRight={props.onSplitRight}
+        onSplitDown={props.onSplitDown}
       />
     </Show>
   );
@@ -46,20 +55,40 @@ const PaneLeafView: Component<{
   isSplit: boolean;
   onActivate: () => void;
   onOpenSettings?: () => void;
+  onSplitRight?: () => void;
+  onSplitDown?: () => void;
 }> = (props) => {
+  const { config } = useConfig();
+  const useCanvasPreview = () =>
+    config().renderer === "canvas" &&
+    !props.isActive &&
+    !!props.store?.state.altScreen &&
+    canUseCanvasRenderer();
+
   return (
     <div
       class="pane-leaf"
       classList={{ "pane-leaf-active": props.isActive && props.isSplit }}
+      role="group"
+      aria-label={`Terminal pane${props.isActive ? " (active)" : ""}`}
       onMouseDown={() => props.onActivate()}
     >
       <Show when={props.store}>
         {(s) => (
-          <Terminal
-            store={s()}
-            active={props.isActive}
-            onOpenSettings={props.onOpenSettings}
-          />
+          <Show
+            when={useCanvasPreview()}
+            fallback={
+              <Terminal
+                store={s()}
+                active={true}
+                onOpenSettings={props.onOpenSettings}
+                onSplitRight={props.onSplitRight}
+                onSplitDown={props.onSplitDown}
+              />
+            }
+          >
+            <CanvasTerminal store={s()} active={false} />
+          </Show>
         )}
       </Show>
     </div>
@@ -72,6 +101,8 @@ const PaneSplitView: Component<{
   activePaneId: string;
   onPaneActivate: (paneId: string) => void;
   onOpenSettings?: () => void;
+  onSplitRight?: (paneId: string) => void;
+  onSplitDown?: (paneId: string) => void;
 }> = (props) => {
   const [ratio, setRatio] = createSignal(props.node.ratio);
   const [dragging, setDragging] = createSignal(false);
@@ -110,17 +141,17 @@ const PaneSplitView: Component<{
   const firstStyle = () => {
     const r = ratio();
     if (isHorizontal()) {
-      return { width: `${r * 100}%`, height: "100%" };
+      return { width: `${r * 100}%`, height: "100%", display: "flex", position: "relative" as const };
     }
-    return { width: "100%", height: `${r * 100}%` };
+    return { width: "100%", height: `${r * 100}%`, display: "flex", position: "relative" as const };
   };
 
   const secondStyle = () => {
     const r = ratio();
     if (isHorizontal()) {
-      return { width: `${(1 - r) * 100}%`, height: "100%" };
+      return { width: `${(1 - r) * 100}%`, height: "100%", display: "flex", position: "relative" as const };
     }
-    return { width: "100%", height: `${(1 - r) * 100}%` };
+    return { width: "100%", height: `${(1 - r) * 100}%`, display: "flex", position: "relative" as const };
   };
 
   return (
@@ -139,6 +170,8 @@ const PaneSplitView: Component<{
           activePaneId={props.activePaneId}
           onPaneActivate={props.onPaneActivate}
           onOpenSettings={props.onOpenSettings}
+          onSplitRight={props.onSplitRight}
+          onSplitDown={props.onSplitDown}
           isSplit={true}
         />
       </div>
@@ -149,6 +182,10 @@ const PaneSplitView: Component<{
           "pane-divider-vertical": !isHorizontal(),
           "pane-divider-dragging": dragging(),
         }}
+        role="separator"
+        aria-orientation={isHorizontal() ? "vertical" : "horizontal"}
+        aria-label="Resize panes"
+        tabIndex={0}
         onMouseDown={handleDividerMouseDown}
       />
       <div style={secondStyle()}>
@@ -158,6 +195,8 @@ const PaneSplitView: Component<{
           activePaneId={props.activePaneId}
           onPaneActivate={props.onPaneActivate}
           onOpenSettings={props.onOpenSettings}
+          onSplitRight={props.onSplitRight}
+          onSplitDown={props.onSplitDown}
           isSplit={true}
         />
       </div>

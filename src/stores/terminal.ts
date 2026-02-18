@@ -7,7 +7,13 @@ import type {
   TerminalStoreState,
 } from "../lib/types";
 import { collectLinesForRange, trimTrailingEmpty } from "../lib/terminal-output";
+import { checkOutput, executeTriggerAction } from "../lib/triggers";
 import { useConfig } from "./config";
+
+// Request notification permission at startup
+if (typeof Notification !== "undefined" && Notification.permission === "default") {
+  Notification.requestPermission().catch(() => {});
+}
 
 export interface TerminalStore {
   state: TerminalStoreState;
@@ -50,6 +56,15 @@ function isClearCommand(command: string | null | undefined): boolean {
 }
 
 function resetStoreHistory(state: TerminalStoreState) {
+  // During alt screen (e.g. tmux is running), preserve block tracking
+  // and tmux state so the session can resume cleanly on exit.
+  if (state.altScreen) {
+    state.snapshots = [];
+    state.scrollbackLines = [];
+    state.fallbackLines = [];
+    state.visibleLinesByGlobal = {};
+    return;
+  }
   state.snapshots = [];
   state.scrollbackLines = [];
   state.fallbackLines = [];
@@ -60,6 +75,15 @@ function resetStoreHistory(state: TerminalStoreState) {
   state.awaitingNonAltReseed = false;
   state.pendingBlock = null;
   state.activeBlock = null;
+  state.tmuxActive = false;
+  state.tmuxCompatibilityNotice = false;
+}
+
+function isTmuxCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+  // Match tmux invoked bare, shell-chained, or via absolute/relative path
+  return /(^|[\s;&|/])tmux(\s|$)/.test(trimmed);
 }
 
 function isFrameDebugEnabled(): boolean {
@@ -105,12 +129,23 @@ export function createTerminalStore(): TerminalStore {
     scrollOffset: 0,
     mouseTracking: false,
     mouseMotion: false,
+    mouseAllMotion: false,
     sgrMouse: false,
+    utf8Mouse: false,
     focusEvents: false,
+    altScroll: false,
+    synchronizedOutput: false,
+    bracketedPaste: false,
+    cursorKeysApplication: false,
+    tmuxActive: false,
+    tmuxCompatibilityNotice: false,
+    tmuxPaneId: null,
     searchOpen: false,
     searchQuery: "",
     searchMatches: [],
     searchCurrentIndex: -1,
+    bell: false,
+    inlineImages: [],
   });
 
   function applyRenderFrame(payload: RenderFramePayload) {
@@ -129,6 +164,7 @@ export function createTerminalStore(): TerminalStore {
               s.altScreen = true;
               s.awaitingNonAltReseed = false;
               s.altScreenLines = [];
+              s.scrollOffset = 0;
               // Only drop visible context when fullscreen TUI is active;
               // inline mode keeps it so history can still render.
               if (config().clearHistoryForTuis) {
@@ -138,6 +174,7 @@ export function createTerminalStore(): TerminalStore {
             case "AltScreenExited":
               s.altScreen = false;
               s.altScreenLines = [];
+              s.scrollOffset = 0;
               // Preserve visible context in inline mode until reseed replaces it
               if (config().clearHistoryForTuis) {
                 s.visibleLinesByGlobal = {};
@@ -159,19 +196,71 @@ export function createTerminalStore(): TerminalStore {
               s.cwd = event.path;
               break;
             case "Bell":
+              s.bell = true;
               break;
             case "MouseModeChanged":
               s.mouseTracking = event.tracking;
               s.mouseMotion = event.motion;
+              s.mouseAllMotion = event.all_motion;
               s.sgrMouse = event.sgr;
+              s.utf8Mouse = event.utf8;
               s.focusEvents = event.focus;
+              s.altScroll = event.alt_scroll;
+              s.synchronizedOutput = event.synchronized_output;
+              s.bracketedPaste = event.bracketed_paste;
+              s.cursorKeysApplication = event.cursor_keys_application;
               break;
             case "ScrollbackCleared":
               // CSI 3J: clear scrollback history
               s.scrollbackLines = [];
               break;
-            case "InlineImage":
-              // Handled by Terminal component
+            case "InlineImage": {
+              const imgEvent = event as { type: "InlineImage"; id: string; data_base64: string; width: number; height: number; row: number; col: number };
+              s.inlineImages = [...s.inlineImages, {
+                id: imgEvent.id,
+                dataUri: `data:image/png;base64,${imgEvent.data_base64}`,
+                width: imgEvent.width,
+                height: imgEvent.height,
+                row: imgEvent.row,
+                col: imgEvent.col,
+              }];
+              if (s.inlineImages.length > 50) {
+                s.inlineImages = s.inlineImages.slice(-50);
+              }
+              break;
+            }
+            case "SixelImage": {
+              const sixelEvent = event as { type: "SixelImage"; id: string; data_base64: string; width: number; height: number; row: number; col: number };
+              s.inlineImages = [...s.inlineImages, {
+                id: sixelEvent.id,
+                dataUri: `data:image/png;base64,${sixelEvent.data_base64}`,
+                width: sixelEvent.width,
+                height: sixelEvent.height,
+                row: sixelEvent.row,
+                col: sixelEvent.col,
+              }];
+              if (s.inlineImages.length > 50) {
+                s.inlineImages = s.inlineImages.slice(-50);
+              }
+              break;
+            }
+            case "KittyImage": {
+              const kittyEvent = event as { type: "KittyImage"; id: string; data_base64: string; width: number; height: number; row: number; col: number };
+              s.inlineImages = [...s.inlineImages, {
+                id: kittyEvent.id,
+                dataUri: `data:image/png;base64,${kittyEvent.data_base64}`,
+                width: kittyEvent.width,
+                height: kittyEvent.height,
+                row: kittyEvent.row,
+                col: kittyEvent.col,
+              }];
+              if (s.inlineImages.length > 50) {
+                s.inlineImages = s.inlineImages.slice(-50);
+              }
+              break;
+            }
+            case "TmuxRequested":
+              // Handled by App.tsx (listens via onTmuxEvent after tmux_start)
               break;
             default:
               // BlockCompleted is ALWAYS deferred to after line processing
@@ -183,13 +272,22 @@ export function createTerminalStore(): TerminalStore {
               if (event.type === "BlockCompleted" || s.altScreen || s.awaitingNonAltReseed) {
                 queuedBlockEvents.push(event);
               } else {
+                // Flush queued events, but KEEP any BlockCompleted events
+                // in the queue — they must always run after line processing
+                // so finalizeActiveBlock sees updated visibleLinesByGlobal.
                 if (queuedBlockEvents.length > 0) {
-                  const queued = queuedBlockEvents.splice(0, queuedBlockEvents.length);
-                  for (const q of queued) {
-                    processBlockEvent(s, q);
+                  const kept: typeof queuedBlockEvents = [];
+                  const flushed = queuedBlockEvents.splice(0, queuedBlockEvents.length);
+                  for (const q of flushed) {
+                    if (q.type === "BlockCompleted") {
+                      kept.push(q);
+                    } else {
+                      processBlockEvent(s, q, config().terminalStyle);
+                    }
                   }
+                  if (kept.length > 0) queuedBlockEvents.push(...kept);
                 }
-                processBlockEvent(s, event);
+                processBlockEvent(s, event, config().terminalStyle);
               }
               break;
           }
@@ -325,7 +423,7 @@ export function createTerminalStore(): TerminalStore {
         if (!s.altScreen && !s.awaitingNonAltReseed && queuedBlockEvents.length > 0) {
           const queued = queuedBlockEvents.splice(0, queuedBlockEvents.length);
           for (const q of queued) {
-            processBlockEvent(s, q);
+            processBlockEvent(s, q, config().terminalStyle);
           }
         }
 
@@ -336,6 +434,17 @@ export function createTerminalStore(): TerminalStore {
         }
       }),
     );
+
+    // Check output triggers (outside produce to avoid side effects in store updates)
+    for (const line of frame.lines) {
+      const text = line.spans.map((s: { text: string }) => s.text).join("");
+      if (text.trim()) {
+        const trigger = checkOutput(text);
+        if (trigger) {
+          executeTriggerAction(trigger, text);
+        }
+      }
+    }
   }
 
   function applyResizeAck(payload: ResizeAckPayload) {
@@ -441,7 +550,11 @@ function hasAllVisibleRows(buffer: RenderedLine[], rows: number): boolean {
   return true;
 }
 
-function processBlockEvent(state: TerminalStoreState, event: TerminalEvent) {
+function processBlockEvent(
+  state: TerminalStoreState,
+  event: TerminalEvent,
+  terminalStyle: "chat" | "traditional",
+) {
   switch (event.type) {
     case "BlockStarted": {
       state.shellIntegrationActive = true;
@@ -454,12 +567,20 @@ function processBlockEvent(state: TerminalStoreState, event: TerminalEvent) {
         ? state.pendingBlock
         : null;
       state.pendingBlock = null;
+      const tmuxCommand = isTmuxCommand(event.command);
+      if (tmuxCommand) {
+        if (!state.tmuxActive && terminalStyle === "chat") {
+          state.tmuxCompatibilityNotice = true;
+        }
+        state.tmuxActive = true;
+      }
       state.activeBlock = {
         id: event.id,
         command: event.command,
         cwd: pending?.cwd ?? state.cwd,
         startTime: Date.now(),
         outputStart: event.global_row,
+        tmuxCommand,
       };
       break;
     }
@@ -512,7 +633,26 @@ function finalizeActiveBlock(state: TerminalStoreState, event: TerminalEvent) {
       cwd: active.cwd || state.cwd,
       failed,
     });
+
+    // Notify for long-running commands when window is not focused
+    if (typeof document !== "undefined" && document.hidden) {
+      const elapsed = Date.now() - (active.startTime ?? Date.now());
+      if (elapsed > 5000 && active.command) {
+        try {
+          const status = event.exit_code === 0 ? "completed" : "failed";
+          new Notification(`Command ${status}`, {
+            body: active.command,
+            silent: true,
+          });
+        } catch {
+          // Notifications may not be available
+        }
+      }
+    }
   }
 
+  if (active.tmuxCommand) {
+    state.tmuxActive = false;
+  }
   state.activeBlock = null;
 }

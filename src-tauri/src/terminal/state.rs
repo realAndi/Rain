@@ -1,6 +1,7 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use unicode_width::UnicodeWidthChar;
 
-use super::color::Color;
+use super::color::{Color, indexed_to_rgb};
 use super::cursor::{CellAttrs, CursorShape, CursorState};
 use super::grid::{Cell, CellFlags, Grid};
 use super::modes::TerminalModes;
@@ -23,6 +24,8 @@ pub struct TerminalState {
     cols: u16,
     rows: u16,
     dcs_buffer: Vec<u8>,
+    dcs_intermediates: Vec<u8>,
+    dcs_action: Option<char>,
     /// Lines that scrolled off the top of the visible grid. Captured so the
     /// frontend can accumulate full command output even for long outputs.
     scrolled_off_buffer: Vec<RenderedLine>,
@@ -43,6 +46,18 @@ pub struct TerminalState {
     image_counter: u64,
     /// DEC Special Graphics charset active (ESC ( 0)
     charset_g0_drawing: bool,
+    /// BEL character received; included in the next render frame then cleared.
+    bell_pending: bool,
+    /// True when inside a Sixel DCS sequence
+    sixel_active: bool,
+    /// Accumulated Sixel data buffer
+    sixel_buffer: Vec<u8>,
+    /// Gate for image protocols (OSC 1337 / Sixel / Kitty scaffolding).
+    experimental_image_protocols_enabled: bool,
+    /// One-shot warning guard when image protocol data is ignored.
+    image_protocol_drop_notified: bool,
+    /// Last character passed through `print()`, used by CSI REP (`b`).
+    last_printed_char: char,
 }
 
 /// Snapshot of terminal render data extracted under lock.
@@ -75,8 +90,10 @@ impl RenderSnapshot {
     }
 }
 
+
 impl TerminalState {
     pub fn new(rows: u16, cols: u16) -> Self {
+        let image_protocols_enabled = true;
         let mut tab_stops = vec![false; cols as usize];
         for i in (0..cols as usize).step_by(8) {
             tab_stops[i] = true;
@@ -97,6 +114,8 @@ impl TerminalState {
             cols,
             rows,
             dcs_buffer: Vec::new(),
+            dcs_intermediates: Vec::new(),
+            dcs_action: None,
             scrolled_off_buffer: Vec::new(),
             scrollback_seq: 0,
             pending_terminal_events: Vec::new(),
@@ -106,6 +125,12 @@ impl TerminalState {
             active_hyperlink: None,
             image_counter: 0,
             charset_g0_drawing: false,
+            bell_pending: false,
+            sixel_active: false,
+            sixel_buffer: Vec::new(),
+            experimental_image_protocols_enabled: image_protocols_enabled,
+            image_protocol_drop_notified: false,
+            last_printed_char: ' ',
         }
     }
 
@@ -141,7 +166,8 @@ impl TerminalState {
                 let idx = visible_offset + i;
                 if idx < self.grid.rows.len() {
                     let spans = self.grid.rows[idx].to_styled_spans();
-                    self.scrolled_off_buffer.push(RenderedLine { index: 0, spans });
+                    self.scrolled_off_buffer
+                        .push(RenderedLine { index: 0, spans });
                     self.scrollback_seq = self.scrollback_seq.saturating_add(1);
                 }
             }
@@ -188,6 +214,10 @@ impl TerminalState {
             });
             self.title_changed = false;
         }
+        if self.bell_pending {
+            all_events.push(TerminalEvent::Bell);
+            self.bell_pending = false;
+        }
 
         if dirty_lines.is_empty() && all_events.is_empty() && scrolled_lines.is_empty() {
             return None;
@@ -199,7 +229,11 @@ impl TerminalState {
             CursorShape::Bar => "bar",
         };
 
-        let visible_base_global = if self.using_alt { 0 } else { self.scrollback_seq };
+        let visible_base_global = if self.using_alt {
+            0
+        } else {
+            self.scrollback_seq
+        };
         self.frame_seq = self.frame_seq.saturating_add(1);
         let frame_seq = self.frame_seq;
 
@@ -283,7 +317,8 @@ impl TerminalState {
     }
 
     fn cursor_up(&mut self, n: u16) {
-        let min_row = if self.cursor.row >= self.scroll_top && self.cursor.row <= self.scroll_bottom {
+        let min_row = if self.cursor.row >= self.scroll_top && self.cursor.row <= self.scroll_bottom
+        {
             self.scroll_top
         } else {
             0
@@ -292,7 +327,8 @@ impl TerminalState {
     }
 
     fn cursor_down(&mut self, n: u16) {
-        let max_row = if self.cursor.row >= self.scroll_top && self.cursor.row <= self.scroll_bottom {
+        let max_row = if self.cursor.row >= self.scroll_top && self.cursor.row <= self.scroll_bottom
+        {
             self.scroll_bottom
         } else {
             self.rows.saturating_sub(1)
@@ -439,7 +475,8 @@ impl TerminalState {
             self.alt_grid = Some(Grid::new(self.rows, self.cols));
             self.using_alt = true;
             self.modes.alt_screen = true;
-            self.pending_terminal_events.push(TerminalEvent::AltScreenEntered);
+            self.pending_terminal_events
+                .push(TerminalEvent::AltScreenEntered);
         }
     }
 
@@ -449,7 +486,8 @@ impl TerminalState {
             self.modes.alt_screen = false;
             self.alt_grid = None;
             self.grid.mark_all_dirty();
-            self.pending_terminal_events.push(TerminalEvent::AltScreenExited);
+            self.pending_terminal_events
+                .push(TerminalEvent::AltScreenExited);
         }
     }
 
@@ -548,10 +586,29 @@ impl TerminalState {
         }
     }
 
+    fn emit_mode_changed(&mut self) {
+        self.pending_terminal_events
+            .push(TerminalEvent::MouseModeChanged {
+                tracking: self.modes.mouse_tracking,
+                motion: self.modes.mouse_motion,
+                all_motion: self.modes.mouse_all_motion,
+                sgr: self.modes.sgr_mouse,
+                utf8: self.modes.utf8_mouse,
+                focus: self.modes.focus_events,
+                alt_scroll: self.modes.alternate_scroll,
+                synchronized_output: self.modes.synchronized_output,
+                bracketed_paste: self.modes.bracketed_paste,
+                cursor_keys_application: self.modes.cursor_keys_application,
+            });
+    }
+
     fn set_dec_mode(&mut self, params: &[u16], enable: bool) {
         for &p in params {
             match p {
-                1 => self.modes.cursor_keys_application = enable,
+                1 => {
+                    self.modes.cursor_keys_application = enable;
+                    self.emit_mode_changed();
+                }
                 6 => {
                     self.modes.origin = enable;
                     // DECOM toggle homes cursor
@@ -591,39 +648,31 @@ impl TerminalState {
                 }
                 1000 => {
                     self.modes.mouse_tracking = enable;
-                    self.pending_terminal_events.push(TerminalEvent::MouseModeChanged {
-                        tracking: self.modes.mouse_tracking,
-                        motion: self.modes.mouse_motion,
-                        sgr: self.modes.sgr_mouse,
-                        focus: self.modes.focus_events,
-                    });
+                    self.emit_mode_changed();
                 }
                 1002 => {
                     self.modes.mouse_motion = enable;
-                    self.pending_terminal_events.push(TerminalEvent::MouseModeChanged {
-                        tracking: self.modes.mouse_tracking,
-                        motion: self.modes.mouse_motion,
-                        sgr: self.modes.sgr_mouse,
-                        focus: self.modes.focus_events,
-                    });
+                    self.emit_mode_changed();
+                }
+                1003 => {
+                    self.modes.mouse_all_motion = enable;
+                    self.emit_mode_changed();
                 }
                 1004 => {
                     self.modes.focus_events = enable;
-                    self.pending_terminal_events.push(TerminalEvent::MouseModeChanged {
-                        tracking: self.modes.mouse_tracking,
-                        motion: self.modes.mouse_motion,
-                        sgr: self.modes.sgr_mouse,
-                        focus: self.modes.focus_events,
-                    });
+                    self.emit_mode_changed();
+                }
+                1005 => {
+                    self.modes.utf8_mouse = enable;
+                    self.emit_mode_changed();
                 }
                 1006 => {
                     self.modes.sgr_mouse = enable;
-                    self.pending_terminal_events.push(TerminalEvent::MouseModeChanged {
-                        tracking: self.modes.mouse_tracking,
-                        motion: self.modes.mouse_motion,
-                        sgr: self.modes.sgr_mouse,
-                        focus: self.modes.focus_events,
-                    });
+                    self.emit_mode_changed();
+                }
+                1007 => {
+                    self.modes.alternate_scroll = enable;
+                    self.emit_mode_changed();
                 }
                 1049 => {
                     if enable {
@@ -635,9 +684,75 @@ impl TerminalState {
                         self.restore_cursor();
                     }
                 }
-                2004 => self.modes.bracketed_paste = enable,
+                2004 => {
+                    self.modes.bracketed_paste = enable;
+                    self.emit_mode_changed();
+                }
+                2026 => {
+                    self.modes.synchronized_output = enable;
+                    self.emit_mode_changed();
+                }
                 _ => {}
             }
+        }
+    }
+
+    fn report_mode_state(&mut self, mode: u16, set: Option<bool>, dec_private: bool) {
+        let pm = match set {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        };
+        let prefix = if dec_private { "?" } else { "" };
+        let response = format!("\x1b[{}{};{}$y", prefix, mode, pm);
+        self.pending_responses.push(response.into_bytes());
+    }
+
+    fn dec_mode_state(&self, mode: u16) -> Option<bool> {
+        match mode {
+            1 => Some(self.modes.cursor_keys_application),
+            6 => Some(self.modes.origin),
+            7 => Some(self.modes.autowrap),
+            25 => Some(self.modes.cursor_visible),
+            47 | 1047 | 1049 => Some(self.using_alt),
+            1000 => Some(self.modes.mouse_tracking),
+            1002 => Some(self.modes.mouse_motion),
+            1003 => Some(self.modes.mouse_all_motion),
+            1004 => Some(self.modes.focus_events),
+            1005 => Some(self.modes.utf8_mouse),
+            1006 => Some(self.modes.sgr_mouse),
+            1007 => Some(self.modes.alternate_scroll),
+            2004 => Some(self.modes.bracketed_paste),
+            2026 => Some(self.modes.synchronized_output),
+            _ => None,
+        }
+    }
+
+    fn ansi_mode_state(&self, mode: u16) -> Option<bool> {
+        match mode {
+            4 => Some(self.modes.insert),
+            20 => Some(self.modes.linefeed_newline),
+            _ => None,
+        }
+    }
+
+    fn report_dec_modes(&mut self, params: &[u16]) {
+        if params.is_empty() {
+            self.report_mode_state(0, None, true);
+            return;
+        }
+        for &mode in params {
+            self.report_mode_state(mode, self.dec_mode_state(mode), true);
+        }
+    }
+
+    fn report_ansi_modes(&mut self, params: &[u16]) {
+        if params.is_empty() {
+            self.report_mode_state(0, None, false);
+            return;
+        }
+        for &mode in params {
+            self.report_mode_state(mode, self.ansi_mode_state(mode), false);
         }
     }
 
@@ -697,6 +812,17 @@ impl TerminalState {
                             }
                         }
                         "C" => {}
+                        "T" => {
+                            // Rain-specific: tmux command intercepted by shell hook.
+                            // The remaining params contain the raw tmux arguments.
+                            let args: String = params[2..]
+                                .iter()
+                                .map(|p| String::from_utf8_lossy(p))
+                                .collect::<Vec<_>>()
+                                .join(";");
+                            self.pending_terminal_events
+                                .push(TerminalEvent::TmuxRequested { args });
+                        }
                         "D" => {
                             let exit_code = params
                                 .get(2)
@@ -726,6 +852,41 @@ impl TerminalState {
                     self.active_hyperlink = None;
                 }
             }
+            "52" => {
+                self.handle_osc_52(params);
+            }
+            "4" => {
+                if params.len() >= 3 && params[2] == b"?" {
+                    if let Ok(idx_str) = std::str::from_utf8(params[1]) {
+                        if let Ok(index) = idx_str.parse::<u8>() {
+                            let (r, g, b) = indexed_to_rgb(index);
+                            let (r16, g16, b16) =
+                                (r as u16 * 0x0101, g as u16 * 0x0101, b as u16 * 0x0101);
+                            let response = format!(
+                                "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                                index, r16, g16, b16
+                            );
+                            self.pending_responses.push(response.into_bytes());
+                        }
+                    }
+                }
+            }
+            "10" | "11" | "12" => {
+                if params.len() >= 2 && params[1] == b"?" {
+                    let (r, g, b): (u8, u8, u8) = match first {
+                        "10" => (0xd4, 0xd4, 0xd4),
+                        "11" => (0x0e, 0x0e, 0x0e),
+                        _ => (0xd4, 0xd4, 0xd4),
+                    };
+                    let (r16, g16, b16) =
+                        (r as u16 * 0x0101, g as u16 * 0x0101, b as u16 * 0x0101);
+                    let response = format!(
+                        "\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                        first, r16, g16, b16
+                    );
+                    self.pending_responses.push(response.into_bytes());
+                }
+            }
             "1337" => {
                 // iTerm2 inline image protocol: OSC 1337 ; File=<params>:<base64data> ST
                 if params.len() >= 2 {
@@ -750,23 +911,171 @@ impl TerminalState {
                                 }
                             }
 
-                            if is_inline && !base64_data.is_empty() {
+                            if is_inline && !base64_data.is_empty() && self.experimental_image_protocols_enabled {
                                 self.image_counter += 1;
                                 let id = format!("img-{}", self.image_counter);
-                                self.pending_terminal_events.push(TerminalEvent::InlineImage {
-                                    id,
-                                    data_base64: base64_data.to_string(),
-                                    width,
-                                    height,
-                                    row: self.cursor.row,
-                                    col: self.cursor.col,
-                                });
+                                self.pending_terminal_events
+                                    .push(TerminalEvent::InlineImage {
+                                        id,
+                                        data_base64: base64_data.to_string(),
+                                        width,
+                                        height,
+                                        row: self.cursor.row,
+                                        col: self.cursor.col,
+                                    });
+                            } else if is_inline
+                                && !base64_data.is_empty()
+                                && !self.image_protocol_drop_notified
+                            {
+                                tracing::info!(
+                                    "Image protocol payload received but experimental rendering is disabled"
+                                );
+                                self.image_protocol_drop_notified = true;
                             }
                         }
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_osc_52(&mut self, params: &[&[u8]]) {
+        // OSC 52 ; Pc ; Pd
+        // Pc = clipboard selector, Pd = base64 payload or "?" for query.
+        if params.len() < 3 {
+            return;
+        }
+
+        let target = std::str::from_utf8(params[1]).unwrap_or("c");
+        let payload = std::str::from_utf8(params[2]).unwrap_or("");
+
+        if payload == "?" {
+            let current = read_clipboard_text().unwrap_or_default();
+            let encoded = BASE64_STANDARD.encode(current.as_bytes());
+            let response = format!("\x1b]52;{};{}\x1b\\", target, encoded);
+            self.pending_responses.push(response.into_bytes());
+            return;
+        }
+
+        // Empty payload clears clipboard selection by convention.
+        if payload.is_empty() {
+            let _ = write_clipboard_text("");
+            return;
+        }
+
+        if let Ok(decoded) = BASE64_STANDARD.decode(payload.as_bytes()) {
+            let text = String::from_utf8_lossy(&decoded).to_string();
+            let _ = write_clipboard_text(&text);
+        }
+    }
+
+    fn handle_dcs(&mut self, action: Option<char>, intermediates: &[u8], data: &[u8]) {
+        match (action, intermediates) {
+            // XTGETTCAP: DCS + q Pt ST
+            (Some('q'), [b'+']) => self.handle_xtgettcap(data),
+            // DECRQSS: DCS $ q Pt ST
+            (Some('q'), [b'$']) => self.handle_decrqss(data),
+            // tmux passthrough: DCS tmux; ... ST
+            (Some('t'), []) => self.handle_tmux_passthrough(data),
+            _ => {}
+        }
+    }
+
+    fn handle_xtgettcap(&mut self, data: &[u8]) {
+        let raw = String::from_utf8_lossy(data);
+        if raw.trim().is_empty() {
+            self.pending_responses.push(b"\x1bP0+r\x1b\\".to_vec());
+            return;
+        }
+
+        let mut pairs: Vec<String> = Vec::new();
+        for item in raw.split(';') {
+            if item.is_empty() {
+                continue;
+            }
+            let name = match decode_hex_ascii(item) {
+                Some(n) => n,
+                None => {
+                    self.pending_responses.push(b"\x1bP0+r\x1b\\".to_vec());
+                    return;
+                }
+            };
+
+            let Some(value) = tcap_capability_value(&name) else {
+                self.pending_responses.push(b"\x1bP0+r\x1b\\".to_vec());
+                return;
+            };
+
+            let pair = format!("{}={}", encode_hex_ascii(&name), encode_hex_ascii(value));
+            pairs.push(pair);
+        }
+
+        if pairs.is_empty() {
+            self.pending_responses.push(b"\x1bP0+r\x1b\\".to_vec());
+            return;
+        }
+
+        let response = format!("\x1bP1+r{}\x1b\\", pairs.join(";"));
+        self.pending_responses.push(response.into_bytes());
+    }
+
+    fn handle_decrqss(&mut self, data: &[u8]) {
+        // Return a minimal set of queryable status strings used by modern tools.
+        let query = String::from_utf8_lossy(data).to_string();
+        let status = match query.as_str() {
+            // SGR
+            "m" => Some("0m".to_string()),
+            // DECSCUSR (cursor style)
+            " q" => {
+                let cursor_style = match self.cursor.shape {
+                    CursorShape::Block => 2,
+                    CursorShape::Underline => 4,
+                    CursorShape::Bar => 6,
+                };
+                Some(format!("{} q", cursor_style))
+            }
+            // DECSTBM (scroll region)
+            "r" => Some(format!(
+                "{};{}r",
+                self.scroll_top + 1,
+                self.scroll_bottom + 1
+            )),
+            _ => None,
+        };
+
+        if let Some(pt) = status {
+            let response = format!("\x1bP1$r{}\x1b\\", pt);
+            self.pending_responses.push(response.into_bytes());
+        } else {
+            self.pending_responses.push(b"\x1bP0$r\x1b\\".to_vec());
+        }
+    }
+
+    fn handle_tmux_passthrough(&mut self, data: &[u8]) {
+        // tmux wraps passthrough sequences as: DCS tmux; <escaped-payload> ST
+        // where ESC bytes in the payload are doubled.
+        if !data.starts_with(b"mux;") {
+            return;
+        }
+
+        let payload = &data[4..];
+        let mut decoded = Vec::with_capacity(payload.len());
+        let mut i = 0usize;
+        while i < payload.len() {
+            let b = payload[i];
+            if b == 0x1b && i + 1 < payload.len() && payload[i + 1] == 0x1b {
+                decoded.push(0x1b);
+                i += 2;
+            } else {
+                decoded.push(b);
+                i += 1;
+            }
+        }
+
+        let mut parser = vte::Parser::new();
+        for b in decoded {
+            parser.advance(self, b);
         }
     }
 
@@ -815,6 +1124,56 @@ fn param(params: &[u16], idx: usize, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
+fn decode_hex_ascii(input: &str) -> Option<String> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 2);
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        let pair = std::str::from_utf8(&bytes[i..i + 2]).ok()?;
+        let val = u8::from_str_radix(pair, 16).ok()?;
+        out.push(val);
+        i += 2;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn encode_hex_ascii(input: &str) -> String {
+    input
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn tcap_capability_value(name: &str) -> Option<&'static str> {
+    // Capability set needed by tmux and modern TUIs.
+    match name {
+        "TN" | "name" => Some("xterm-256color"),
+        "Co" | "colors" => Some("256"),
+        "RGB" | "Tc" => Some("8"),
+        // OSC 52 clipboard capability (terminfo "Ms")
+        "Ms" => Some("\x1b]52;%p1%s;%p2%s\x07"),
+        // Cursor style: DECSCUSR set and reset (tmux uses these for passthrough)
+        "Ss" => Some("\x1b[%p1%d q"),
+        "Se" => Some("\x1b[2 q"),
+        _ => None,
+    }
+}
+
+fn write_clipboard_text(text: &str) -> Result<(), ()> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|_| ())?;
+    clipboard.set_text(text.to_string()).map_err(|_| ())
+}
+
+fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok()
+}
+
 /// Map ASCII to DEC Special Graphics (line-drawing) character.
 fn dec_line_drawing_char(c: char) -> char {
     match c {
@@ -848,7 +1207,12 @@ fn dec_line_drawing_char(c: char) -> char {
 impl vte::Perform for TerminalState {
     fn print(&mut self, c: char) {
         // Apply DEC Special Graphics charset mapping
-        let c = if self.charset_g0_drawing { dec_line_drawing_char(c) } else { c };
+        let c = if self.charset_g0_drawing {
+            dec_line_drawing_char(c)
+        } else {
+            c
+        };
+        self.last_printed_char = c;
         let width = UnicodeWidthChar::width(c).unwrap_or(1) as u16;
 
         if self.cursor.col >= self.cols {
@@ -897,7 +1261,10 @@ impl vte::Perform for TerminalState {
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            0x07 => {} // BEL
+            0x07 => {
+                // BEL: set flag so the next render frame includes a Bell event
+                self.bell_pending = true;
+            }
             0x08 => self.backspace(),
             0x09 => self.tab(),
             0x0A | 0x0B | 0x0C => {
@@ -919,7 +1286,28 @@ impl vte::Perform for TerminalState {
         action: char,
     ) {
         let raw = extract_params(params);
-        let is_private = intermediates.first() == Some(&b'?');
+        let is_private = intermediates.contains(&b'?');
+        let has_gt = intermediates.contains(&b'>');
+        let has_dollar = intermediates.contains(&b'$');
+
+        // DECRPM / ANSI RQM mode reports
+        if action == 'p' && has_dollar {
+            if is_private {
+                self.report_dec_modes(&raw);
+            } else {
+                self.report_ansi_modes(&raw);
+            }
+            return;
+        }
+
+        // Secondary Device Attributes (DA2): CSI > c
+        if action == 'c' && has_gt {
+            if param(&raw, 0, 0) == 0 {
+                // Report as xterm-like VT100-class terminal with firmware marker.
+                self.pending_responses.push(b"\x1b[>0;10;0c".to_vec());
+            }
+            return;
+        }
 
         match (action, is_private) {
             ('A', false) => self.cursor_up(param(&raw, 0, 1)),
@@ -969,7 +1357,11 @@ impl vte::Perform for TerminalState {
                 let bottom = param(&raw, 1, self.rows).saturating_sub(1);
                 self.scroll_top = top;
                 self.scroll_bottom = bottom.min(self.rows.saturating_sub(1));
-                self.cursor.row = if self.modes.origin { self.scroll_top } else { 0 };
+                self.cursor.row = if self.modes.origin {
+                    self.scroll_top
+                } else {
+                    0
+                };
                 self.cursor.col = 0;
             }
             ('h', true) => self.set_dec_mode(&raw, true),
@@ -985,11 +1377,8 @@ impl vte::Perform for TerminalState {
                     }
                     6 => {
                         // CPR: report cursor position as ESC [ row ; col R (1-based)
-                        let response = format!(
-                            "\x1b[{};{}R",
-                            self.cursor.row + 1,
-                            self.cursor.col + 1
-                        );
+                        let response =
+                            format!("\x1b[{};{}R", self.cursor.row + 1, self.cursor.col + 1);
                         self.pending_responses.push(response.into_bytes());
                     }
                     _ => {}
@@ -998,18 +1387,58 @@ impl vte::Perform for TerminalState {
             ('c', false) => {
                 // Primary Device Attributes - respond as VT220
                 if param(&raw, 0, 0) == 0 {
-                    self.pending_responses
-                        .push(b"\x1b[?62;22c".to_vec());
+                    self.pending_responses.push(b"\x1b[?62;22c".to_vec());
                 }
             }
             ('s', false) => self.save_cursor(),
             ('u', false) => self.restore_cursor(),
-            ('q', false) if intermediates.contains(&b' ') => {
-                match param(&raw, 0, 1) {
-                    0 | 1 | 2 => self.cursor.shape = CursorShape::Block,
-                    3 | 4 => self.cursor.shape = CursorShape::Underline,
-                    5 | 6 => self.cursor.shape = CursorShape::Bar,
-                    _ => {}
+            ('q', false) if intermediates.contains(&b' ') => match param(&raw, 0, 1) {
+                0 | 1 | 2 => self.cursor.shape = CursorShape::Block,
+                3 | 4 => self.cursor.shape = CursorShape::Underline,
+                5 | 6 => self.cursor.shape = CursorShape::Bar,
+                _ => {}
+            },
+            ('b', false) => {
+                let count = param(&raw, 0, 1) as usize;
+                let c = self.last_printed_char;
+                let width = UnicodeWidthChar::width(c).unwrap_or(1) as u16;
+                for _ in 0..count.min(2048) {
+                    if self.cursor.col >= self.cols {
+                        if self.modes.autowrap {
+                            self.carriage_return();
+                            self.linefeed();
+                        } else {
+                            self.cursor.col = self.cols.saturating_sub(1);
+                        }
+                    }
+                    if self.modes.insert {
+                        let row = self.cursor.row;
+                        let col = self.cursor.col;
+                        self.active_grid_mut().insert_cells(row, col, width);
+                    }
+                    let row = self.cursor.row;
+                    let col = self.cursor.col;
+                    let fg = self.cursor.fg;
+                    let bg = self.cursor.bg;
+                    let attrs = self.cursor.attrs;
+                    let cols = self.cols;
+                    let cell = Cell {
+                        c,
+                        fg,
+                        bg,
+                        attrs,
+                        flags: if width == 2 {
+                            CellFlags::WIDE_CHAR
+                        } else {
+                            CellFlags::empty()
+                        },
+                    };
+                    let grid = self.active_grid_mut();
+                    grid.set_cell(row, col, cell);
+                    if width == 2 && col + 1 < cols {
+                        grid.set_cell(row, col + 1, Cell::wide_spacer());
+                    }
+                    self.cursor.col += width;
                 }
             }
             _ => {}
@@ -1031,7 +1460,8 @@ impl vte::Perform for TerminalState {
                 self.frame_seq = frame_seq;
                 self.grid.mark_all_dirty();
                 if was_using_alt {
-                    self.pending_terminal_events.push(TerminalEvent::AltScreenExited);
+                    self.pending_terminal_events
+                        .push(TerminalEvent::AltScreenExited);
                 }
             }
             (b'D', []) => self.linefeed(),
@@ -1048,8 +1478,14 @@ impl vte::Perform for TerminalState {
             (b'M', []) => self.reverse_index(),
             (b'7', []) => self.save_cursor(),
             (b'8', []) => self.restore_cursor(),
-            (b'=', []) => self.modes.cursor_keys_application = true,
-            (b'>', []) => self.modes.cursor_keys_application = false,
+            (b'=', []) => {
+                self.modes.cursor_keys_application = true;
+                self.emit_mode_changed();
+            }
+            (b'>', []) => {
+                self.modes.cursor_keys_application = false;
+                self.emit_mode_changed();
+            }
             // SCS G0: DEC Special Graphics (line drawing)
             (b'0', [b'(']) => self.charset_g0_drawing = true,
             // SCS G0: ASCII
@@ -1058,15 +1494,67 @@ impl vte::Perform for TerminalState {
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+    fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
         self.dcs_buffer.clear();
+        self.dcs_intermediates.clear();
+        self.dcs_intermediates.extend_from_slice(intermediates);
+        self.dcs_action = Some(action);
+
+        // Sixel detection: DCS with action 'q' and no intermediates starts a
+        // Sixel image stream. (DCS+q is XTGETTCAP, DCS$q is DECRQSS — both
+        // have intermediates so they won't match here.)
+        if action == 'q' && intermediates.is_empty() && self.experimental_image_protocols_enabled {
+            self.sixel_active = true;
+            self.sixel_buffer.clear();
+        } else if action == 'q' && intermediates.is_empty() && !self.image_protocol_drop_notified {
+            tracing::info!("Sixel payload received but experimental rendering is disabled");
+            self.image_protocol_drop_notified = true;
+        }
     }
 
     fn put(&mut self, byte: u8) {
-        self.dcs_buffer.push(byte);
+        // Sixel data goes into the dedicated sixel buffer
+        if self.sixel_active {
+            if self.sixel_buffer.len() < 16 * 1024 * 1024 {
+                self.sixel_buffer.push(byte);
+            }
+            return;
+        }
+        // Cap DCS buffer at 16 MB to prevent unbounded growth from malformed streams
+        if self.dcs_buffer.len() < 16 * 1024 * 1024 {
+            self.dcs_buffer.push(byte);
+        }
     }
 
     fn unhook(&mut self) {
+        // Sixel: finalize the accumulated image data
+        if self.sixel_active {
+            self.sixel_active = false;
+            let data = std::mem::take(&mut self.sixel_buffer);
+            if !data.is_empty() {
+                self.image_counter += 1;
+                let id = format!("sixel-{}", self.image_counter);
+                let encoded = BASE64_STANDARD.encode(&data);
+                self.pending_terminal_events
+                    .push(TerminalEvent::SixelImage {
+                        id,
+                        data_base64: encoded,
+                        width: 0,
+                        height: 0,
+                        row: self.cursor.row,
+                        col: self.cursor.col,
+                    });
+            }
+            self.dcs_buffer.clear();
+            self.dcs_intermediates.clear();
+            self.dcs_action.take();
+            return;
+        }
+
+        let data = std::mem::take(&mut self.dcs_buffer);
+        let intermediates = std::mem::take(&mut self.dcs_intermediates);
+        let action = self.dcs_action.take();
+        self.handle_dcs(action, &intermediates, &data);
         self.dcs_buffer.clear();
     }
 }
@@ -1117,21 +1605,45 @@ mod tests {
 
         // Position to row 3, col 1 and write "Hello"
         feed_bytes(&mut state, b"\x1b[3;1HHello");
-        assert_eq!(state.cursor.row, 2, "row should be 2 (0-based) after CSI 3;1 H");
+        assert_eq!(
+            state.cursor.row, 2,
+            "row should be 2 (0-based) after CSI 3;1 H"
+        );
 
         // Position to row 5, col 1 and write "World"
         feed_bytes(&mut state, b"\x1b[5;1HWorld");
-        assert_eq!(state.cursor.row, 4, "row should be 4 (0-based) after CSI 5;1 H");
+        assert_eq!(
+            state.cursor.row, 4,
+            "row should be 4 (0-based) after CSI 5;1 H"
+        );
 
         // Verify grid content: row 2 should have "Hello", row 4 should have "World"
         let grid = state.alt_grid.as_ref().unwrap();
-        let row2_text: String = grid.visible_row(2).cells.iter().take(5).map(|c| c.c).collect();
-        let row4_text: String = grid.visible_row(4).cells.iter().take(5).map(|c| c.c).collect();
+        let row2_text: String = grid
+            .visible_row(2)
+            .cells
+            .iter()
+            .take(5)
+            .map(|c| c.c)
+            .collect();
+        let row4_text: String = grid
+            .visible_row(4)
+            .cells
+            .iter()
+            .take(5)
+            .map(|c| c.c)
+            .collect();
         assert_eq!(row2_text, "Hello", "row 2 should contain Hello");
         assert_eq!(row4_text, "World", "row 4 should contain World");
 
         // Row 3 should be blank (spaces)
-        let row3_text: String = grid.visible_row(3).cells.iter().take(5).map(|c| c.c).collect();
+        let row3_text: String = grid
+            .visible_row(3)
+            .cells
+            .iter()
+            .take(5)
+            .map(|c| c.c)
+            .collect();
         assert_eq!(row3_text, "     ", "row 3 should be blank");
     }
 
@@ -1155,12 +1667,18 @@ mod tests {
 
         // CSI 3;1 H should go to scroll_top + 2 = row 7
         feed_bytes(&mut state, b"\x1b[3;1H");
-        assert_eq!(state.cursor.row, 7, "origin mode: row 3 → scroll_top + 2 (7)");
+        assert_eq!(
+            state.cursor.row, 7,
+            "origin mode: row 3 → scroll_top + 2 (7)"
+        );
 
         // Disable origin mode
         feed_bytes(&mut state, b"\x1b[?6l");
         assert!(!state.modes.origin);
-        assert_eq!(state.cursor.row, 0, "disabling origin mode homes cursor to 0");
+        assert_eq!(
+            state.cursor.row, 0,
+            "disabling origin mode homes cursor to 0"
+        );
 
         // CSI 3;1 H should go to absolute row 2 (0-based)
         feed_bytes(&mut state, b"\x1b[3;1H");
@@ -1186,7 +1704,10 @@ mod tests {
 
         // CUD 20: should stop at scroll_bottom (15), not 23
         feed_bytes(&mut state, b"\x1b[20B");
-        assert_eq!(state.cursor.row, 15, "CUD inside region stops at scroll_bottom");
+        assert_eq!(
+            state.cursor.row, 15,
+            "CUD inside region stops at scroll_bottom"
+        );
 
         // Place cursor outside region (row 2)
         feed_bytes(&mut state, b"\x1b[3;1H");
@@ -1244,10 +1765,222 @@ mod tests {
         // Write to specific rows
         feed_bytes(&mut state, b"\x1b[3;1HAAA\x1b[7;1HBBB");
 
-        let snapshot = state.take_render_snapshot().expect("should have dirty lines");
+        let snapshot = state
+            .take_render_snapshot()
+            .expect("should have dirty lines");
         // Should have exactly 2 dirty lines (rows 2 and 6, 0-based)
         assert_eq!(snapshot.lines.len(), 2, "should have 2 dirty lines");
-        assert_eq!(snapshot.lines[0].index, 2, "first dirty line should be row 2");
-        assert_eq!(snapshot.lines[1].index, 6, "second dirty line should be row 6");
+        assert_eq!(
+            snapshot.lines[0].index, 2,
+            "first dirty line should be row 2"
+        );
+        assert_eq!(
+            snapshot.lines[1].index, 6,
+            "second dirty line should be row 6"
+        );
+    }
+
+    #[test]
+    fn secondary_device_attributes_reports_da2() {
+        let mut state = TerminalState::new(24, 80);
+        feed_bytes(&mut state, b"\x1b[>c");
+        let responses = state.take_pending_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], b"\x1b[>0;10;0c".to_vec());
+    }
+
+    #[test]
+    fn decrpm_reports_mode_state() {
+        let mut state = TerminalState::new(24, 80);
+        feed_bytes(&mut state, b"\x1b[?1004h");
+        feed_bytes(&mut state, b"\x1b[?1004$p");
+        let responses = state.take_pending_responses();
+        assert_eq!(
+            responses.last(),
+            Some(&b"\x1b[?1004;1$y".to_vec()),
+            "mode 1004 should report as set"
+        );
+
+        feed_bytes(&mut state, b"\x1b[?9999$p");
+        let responses = state.take_pending_responses();
+        assert_eq!(
+            responses.last(),
+            Some(&b"\x1b[?9999;0$y".to_vec()),
+            "unknown mode should report as unrecognized"
+        );
+    }
+
+    #[test]
+    fn xtgettcap_reports_known_capabilities() {
+        let mut state = TerminalState::new(24, 80);
+        // Request TN and Co capabilities.
+        feed_bytes(&mut state, b"\x1bP+q544e;436f\x1b\\");
+        let responses = state.take_pending_responses();
+        assert_eq!(responses.len(), 1);
+        let response = String::from_utf8_lossy(&responses[0]);
+        assert!(
+            response.starts_with("\x1bP1+r"),
+            "XTGETTCAP should return success response"
+        );
+        assert!(
+            response.contains("544e=787465726d2d323536636f6c6f72"),
+            "TN capability should be encoded in the response"
+        );
+        assert!(
+            response.contains("436f=323536"),
+            "Co capability should be encoded in the response"
+        );
+    }
+
+    #[test]
+    fn tmux_passthrough_replays_inner_sequences() {
+        let mut state = TerminalState::new(24, 80);
+        // tmux passthrough wrapper with inner CSI > c query.
+        feed_bytes(&mut state, b"\x1bPtmux;\x1b\x1b[>c\x1b\\");
+        let responses = state.take_pending_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], b"\x1b[>0;10;0c".to_vec());
+    }
+
+    #[test]
+    fn test_grid_resize() {
+        let mut state = TerminalState::new(10, 40);
+        feed_bytes(&mut state, b"Hello");
+        assert_eq!(state.cursor.col, 5);
+
+        state.resize(10, 20);
+        let text: String = state
+            .grid
+            .visible_row(0)
+            .cells
+            .iter()
+            .take(5)
+            .map(|c| c.c)
+            .collect();
+        assert_eq!(text, "Hello", "text should survive column resize");
+        assert_eq!(state.cols, 20);
+    }
+
+    #[test]
+    fn test_scrollback_capture() {
+        let mut state = TerminalState::new(5, 20);
+        for i in 0..8u8 {
+            let line = format!("line{}\r\n", i);
+            feed_bytes(&mut state, line.as_bytes());
+        }
+        assert!(
+            state.scrollback_seq >= 3,
+            "should have accumulated scrollback after overflowing visible rows"
+        );
+    }
+
+    #[test]
+    fn test_sgr_256_color() {
+        let mut state = TerminalState::new(24, 80);
+        feed_bytes(&mut state, b"\x1b[38;5;196m");
+        assert_eq!(state.cursor.fg, Color::Indexed(196));
+    }
+
+    #[test]
+    fn test_sgr_rgb_color() {
+        let mut state = TerminalState::new(24, 80);
+        feed_bytes(&mut state, b"\x1b[38;2;128;64;32m");
+        assert_eq!(state.cursor.fg, Color::Rgb(128, 64, 32));
+    }
+
+    #[test]
+    fn test_cursor_save_restore() {
+        let mut state = TerminalState::new(24, 80);
+        feed_bytes(&mut state, b"\x1b[5;10H");
+        assert_eq!(state.cursor.row, 4);
+        assert_eq!(state.cursor.col, 9);
+
+        feed_bytes(&mut state, b"\x1b7");
+        feed_bytes(&mut state, b"\x1b[1;1H");
+        assert_eq!(state.cursor.row, 0);
+        assert_eq!(state.cursor.col, 0);
+
+        feed_bytes(&mut state, b"\x1b8");
+        assert_eq!(state.cursor.row, 4, "cursor row should be restored");
+        assert_eq!(state.cursor.col, 9, "cursor col should be restored");
+    }
+
+    #[test]
+    fn test_alt_screen() {
+        let mut state = TerminalState::new(24, 80);
+        feed_bytes(&mut state, b"MainText");
+        let main_text: String = state
+            .grid
+            .visible_row(0)
+            .cells
+            .iter()
+            .take(8)
+            .map(|c| c.c)
+            .collect();
+        assert_eq!(main_text, "MainText");
+
+        feed_bytes(&mut state, b"\x1b[?1049h");
+        assert!(state.using_alt);
+        feed_bytes(&mut state, b"AltStuff");
+
+        feed_bytes(&mut state, b"\x1b[?1049l");
+        assert!(!state.using_alt);
+        let restored: String = state
+            .grid
+            .visible_row(0)
+            .cells
+            .iter()
+            .take(8)
+            .map(|c| c.c)
+            .collect();
+        assert_eq!(
+            restored, "MainText",
+            "main screen content should be preserved after alt screen round-trip"
+        );
+    }
+
+    #[test]
+    fn test_scroll_region() {
+        let mut state = TerminalState::new(10, 20);
+        for i in 0..10u8 {
+            feed_bytes(
+                &mut state,
+                format!("\x1b[{};1H{}", i + 1, (b'A' + i) as char).as_bytes(),
+            );
+        }
+
+        feed_bytes(&mut state, b"\x1b[3;6r");
+        assert_eq!(state.scroll_top, 2);
+        assert_eq!(state.scroll_bottom, 5);
+
+        feed_bytes(&mut state, b"\x1b[6;1H");
+        assert_eq!(state.cursor.row, 5);
+
+        feed_bytes(&mut state, b"\n");
+
+        let r0 = state.grid.visible_row(0).cells[0].c;
+        assert_eq!(r0, 'A', "row above scroll region should be unchanged");
+
+        let r6 = state.grid.visible_row(6).cells[0].c;
+        assert_eq!(r6, 'G', "row below scroll region should be unchanged");
+
+        let r2 = state.grid.visible_row(2).cells[0].c;
+        assert_eq!(r2, 'D', "first row of region should have scrolled up");
+    }
+
+    #[test]
+    fn test_csi_rep() {
+        let mut state = TerminalState::new(24, 80);
+        feed_bytes(&mut state, b"A");
+        feed_bytes(&mut state, b"\x1b[3b");
+        let text: String = state
+            .grid
+            .visible_row(0)
+            .cells
+            .iter()
+            .take(4)
+            .map(|c| c.c)
+            .collect();
+        assert_eq!(text, "AAAA", "1 original + 3 repeated 'A's");
     }
 }

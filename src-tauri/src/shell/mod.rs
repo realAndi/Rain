@@ -68,8 +68,7 @@ impl ShellIntegration {
     /// Called when OSC 7 is received (working directory update).
     pub fn set_cwd(&mut self, path: String) {
         self.cwd = path.clone();
-        self.pending_events
-            .push(TerminalEvent::CwdChanged { path });
+        self.pending_events.push(TerminalEvent::CwdChanged { path });
     }
 
     /// Check if there are pending events to send.

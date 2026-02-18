@@ -23,6 +23,16 @@ function __rain_prompt --on-event fish_prompt
     printf '\033]133;A\007'
 end
 
+# Intercept tmux so Rain can handle it via control mode.
+# Users can bypass with `command tmux`, RAIN_TMUX_MODE=native, or RAIN_NATIVE_TMUX=1.
+function tmux --wraps tmux
+    if test "$RAIN_TMUX_MODE" = "native"; or set -q RAIN_NATIVE_TMUX
+        command tmux $argv
+        return
+    end
+    printf '\033]133;T;%s\007' (string join " " -- $argv)
+end
+
 function __rain_preexec --on-event fish_preexec
     # OSC 133;B - command identified
     printf '\033]133;B;%s\007' $argv[1]

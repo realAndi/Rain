@@ -32,6 +32,16 @@ __rain_before_cmd() {
     __rain_cmd_active=1
 }
 
+# Intercept tmux so Rain can handle it via control mode.
+# Users can bypass with `command tmux`, RAIN_TMUX_MODE=native, or RAIN_NATIVE_TMUX=1.
+tmux() {
+    if [[ "$RAIN_TMUX_MODE" == "native" || -n "$RAIN_NATIVE_TMUX" ]]; then
+        command tmux "$@"
+        return
+    fi
+    printf '\033]133;T;%s\007' "$*"
+}
+
 # Hook into PROMPT_COMMAND for the before-prompt callback
 __rain_saved_prompt_cmd="${PROMPT_COMMAND:-}"
 PROMPT_COMMAND='__rain_before_prompt; '"${__rain_saved_prompt_cmd}"

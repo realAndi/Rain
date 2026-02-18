@@ -1,139 +1,20 @@
-use tauri::{AppHandle, Manager, State};
+use std::collections::HashMap;
+
+use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
-use super::AppState;
+use crate::ipc::AppState;
 use crate::pty::reader::spawn_pty_threads;
 
-/// Set the native window background blur radius on macOS via CoreGraphics SPI.
-/// This directly controls the gaussian blur applied to desktop content behind the
-/// window, giving pixel-level control over blur intensity. Radius 0 = no blur.
-#[tauri::command]
-pub fn set_window_blur_radius(app: AppHandle, radius: u32) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let window = app
-            .get_webview_window("main")
-            .ok_or("Failed to get main window")?;
-
-        window
-            .with_webview(move |webview| unsafe {
-                use objc2_app_kit::NSWindow;
-
-                extern "C" {
-                    fn CGSDefaultConnectionForThread() -> i32;
-                    fn CGSSetWindowBackgroundBlurRadius(
-                        cid: i32,
-                        wid: i32,
-                        radius: i32,
-                    ) -> i32;
-                }
-
-                let ns_window_ptr: *mut NSWindow = webview.ns_window().cast();
-                if !ns_window_ptr.is_null() {
-                    let ns_window = &*ns_window_ptr;
-                    let wid = ns_window.windowNumber() as i32;
-                    let cid = CGSDefaultConnectionForThread();
-                    CGSSetWindowBackgroundBlurRadius(cid, wid, radius as i32);
-                }
-            })
-            .map_err(|e| format!("Failed to set blur radius: {}", e))?;
-
-        tracing::info!("Window blur radius set to {}px", radius);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (app, radius);
-    }
-
-    Ok(())
+/// Result of creating a new terminal session.
+#[derive(serde::Serialize, Clone)]
+pub struct CreateSessionResult {
+    pub session_id: String,
+    /// True when Rain itself is running inside an existing tmux session.
+    pub inside_tmux: bool,
 }
 
-/// Set the native window opacity (alpha value) on macOS.
-/// This controls the entire window's transparency at the OS level,
-/// making everything (text, UI, background) fade together.
-#[tauri::command]
-pub fn set_window_opacity(app: AppHandle, opacity: f64) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let window = app
-            .get_webview_window("main")
-            .ok_or("Failed to get main window")?;
-
-        let alpha = opacity.clamp(0.0, 1.0);
-
-        window
-            .with_webview(move |webview| unsafe {
-                use objc2_app_kit::NSWindow;
-
-                let ns_window_ptr: *mut NSWindow = webview.ns_window().cast();
-                if !ns_window_ptr.is_null() {
-                    let ns_window = &*ns_window_ptr;
-                    ns_window.setAlphaValue(alpha);
-                }
-            })
-            .map_err(|e| format!("Failed to set opacity: {}", e))?;
-
-        tracing::info!("Window opacity set to {:.0}%", alpha * 100.0);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (app, opacity);
-    }
-
-    Ok(())
-}
-
-/// Set the macOS dock icon at runtime from a bundled resource.
-#[tauri::command]
-pub fn set_app_icon(app: AppHandle, icon_name: String) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        use objc2::AnyThread;
-        use objc2_app_kit::{NSApplication, NSImage};
-        use objc2_foundation::{MainThreadMarker, NSString};
-
-        let filename = match icon_name.as_str() {
-            "default" => "icons/default-icon.png",
-            "simple" => "icons/simple-icon.png",
-            _ => return Err(format!("Unknown icon: {}", icon_name)),
-        };
-
-        let resource_path = app
-            .path()
-            .resource_dir()
-            .map_err(|e| format!("Resource dir error: {}", e))?
-            .join(filename);
-
-        unsafe {
-            let mtm = MainThreadMarker::new_unchecked();
-            let ns_path = NSString::from_str(resource_path.to_str().unwrap());
-            let image = NSImage::initByReferencingFile(NSImage::alloc(), &ns_path);
-            NSApplication::sharedApplication(mtm).setApplicationIconImage(image.as_deref());
-        }
-
-        tracing::info!("App icon set to '{}'", icon_name);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (app, icon_name);
-    }
-
-    Ok(())
-}
-
-/// Get the system hostname.
-#[tauri::command]
-pub fn get_hostname() -> String {
-    hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "localhost".to_string())
-}
-
-/// Create a new terminal session. Returns the session ID.
+/// Create a new terminal session. Returns the session ID and env info.
 #[tauri::command]
 pub fn create_session(
     app: AppHandle,
@@ -142,7 +23,9 @@ pub fn create_session(
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
-) -> Result<String, String> {
+    env: Option<HashMap<String, String>>,
+    tmux_mode: Option<String>,
+) -> Result<CreateSessionResult, String> {
     let rows = rows.unwrap_or(24);
     let cols = cols.unwrap_or(80);
 
@@ -150,7 +33,14 @@ pub fn create_session(
 
     let spawn_result = state
         .pty_manager
-        .spawn_session(shell.as_deref(), cwd.as_deref(), rows, cols)
+        .spawn_session(
+            shell.as_deref(),
+            cwd.as_deref(),
+            rows,
+            cols,
+            env.as_ref(),
+            tmux_mode.as_deref(),
+        )
         .map_err(|e| format!("Failed to spawn session: {}", e))?;
 
     let mut session = spawn_result.session;
@@ -159,11 +49,15 @@ pub fn create_session(
     // Start parser/render threads (with shared writer for DSR/DA responses)
     let terminal_state = session.state();
     let writer = session.writer();
+    let child = session.child();
+    let exit_code = session.exit_code();
     let running = session.running();
     let handles = spawn_pty_threads(
         reader,
         terminal_state,
         writer,
+        child,
+        exit_code,
         app.clone(),
         session_id.clone(),
         running,
@@ -173,7 +67,13 @@ pub fn create_session(
     tracing::info!("Created session {} ({}x{})", &session_id[..8], cols, rows);
     state.sessions.lock().insert(session_id.clone(), session);
 
-    Ok(session_id)
+    // Detect if Rain is running inside an existing tmux session
+    let inside_tmux = std::env::var("TMUX").is_ok();
+
+    Ok(CreateSessionResult {
+        session_id,
+        inside_tmux,
+    })
 }
 
 /// Write input bytes to a terminal session (keyboard input).
@@ -217,8 +117,6 @@ pub fn resize_terminal(
     rows: u16,
     cols: u16,
 ) -> Result<(), String> {
-    use tauri::Emitter;
-
     let sessions = state.sessions.lock();
     let session = sessions
         .get(&session_id)
@@ -256,6 +154,7 @@ pub fn resize_terminal(
 /// Destroy a terminal session.
 #[tauri::command]
 pub fn destroy_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    state.session_transfer_state.lock().remove(&session_id);
     let mut sessions = state.sessions.lock();
     if let Some(mut session) = sessions.remove(&session_id) {
         session.kill();
@@ -293,12 +192,35 @@ pub fn request_full_redraw(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<(), String> {
-    let sessions = state.sessions.lock();
-    let session = sessions
-        .get(&session_id)
-        .ok_or_else(|| format!("Session not found: {}", session_id))?;
+    // Check regular PTY sessions first
+    {
+        let sessions = state.sessions.lock();
+        if let Some(session) = sessions.get(&session_id) {
+            session.request_full_redraw();
+            return Ok(());
+        }
+    }
 
-    session.request_full_redraw();
+    // Check tmux pane handles
+    {
+        let ctrl = state.tmux_controller.lock();
+        if let Some(ref controller) = *ctrl {
+            let handles = controller.pane_handles.lock();
+            if let Some(handle) = handles.get(&session_id) {
+                let mut ts = handle.state.lock();
+                if ts.using_alt {
+                    if let Some(ref mut alt) = ts.alt_grid {
+                        alt.mark_all_dirty();
+                    }
+                } else {
+                    ts.grid.mark_all_dirty();
+                }
+                drop(ts);
+                let _ = handle.render_waker.try_send(());
+                return Ok(());
+            }
+        }
+    }
 
-    Ok(())
+    Err(format!("Session not found: {}", session_id))
 }

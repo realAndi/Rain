@@ -72,6 +72,10 @@ npm run tauri build
 | `Cmd+Shift+]` | Next tab |
 | `Shift+Enter` | New line in input |
 
+## Credits
+
+- [tauri-plugin-liquid-glass](https://github.com/hkandala/tauri-plugin-liquid-glass) — macOS 26+ Liquid Glass support for Tauri v2
+
 ## License
 
 MIT

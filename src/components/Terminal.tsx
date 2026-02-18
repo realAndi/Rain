@@ -1,6 +1,6 @@
-import { Component, For, Show, onMount, onCleanup, createSignal, createEffect, createMemo, on } from "solid-js";
+import { Component, For, Show, onMount, onCleanup, createSignal, createEffect, createMemo, on, untrack } from "solid-js";
+import { ContextMenu } from "./ContextMenu";
 import { produce } from "solid-js/store";
-import { appVersion } from "../lib/version";
 import type { TerminalStore } from "../stores/terminal";
 import type { CommandSnapshot, RenderedLine, SearchMatch } from "../lib/types";
 import {
@@ -12,346 +12,36 @@ import {
 } from "../lib/selection";
 import { useConfig } from "../stores/config";
 import { createInputBuffer } from "../stores/inputBuffer";
-import { writeInput, resizeTerminal, requestFullRedraw, getHostname as fetchHostname } from "../lib/ipc";
+import { writeInput, resizeTerminal, requestFullRedraw, tmuxSendKeys, tmuxResizePane, saveTextToFile } from "../lib/ipc";
+import { checkPasteContent } from "../lib/pasteSafety";
 import { keyEventToBytes } from "../lib/input";
 import { measureFontMetrics, calculateTerminalSize, invalidateFontMetrics, type FontMetrics } from "../lib/font";
 import { collectLinesForRange } from "../lib/terminal-output";
 import { TerminalLine } from "./TerminalLine";
 import { Cursor } from "./Cursor";
 import { IconFolder, IconCopy, IconCommand, IconArrowDown } from "./icons";
+import { matchesKeybinding } from "../lib/keybindings";
+import { buildFullGrid, formatCwdSimplified, extractUsername, getHostname, formatCwdDefault } from "./terminal/utils";
+import { CommandBlock } from "./terminal/CommandBlock";
+import { TraditionalBlock } from "./terminal/TraditionalBlock";
+import { WelcomeState } from "./terminal/WelcomeState";
+import { SearchBar } from "./terminal/SearchBar";
 
-// Build a complete grid of `rows` lines from a sparse buffer, filling gaps with empty lines
-function buildFullGrid(buffer: RenderedLine[], rows: number): RenderedLine[] {
-  const byIndex = new Map<number, RenderedLine>();
-  for (const line of buffer) byIndex.set(line.index, line);
-  const result: RenderedLine[] = [];
-  for (let i = 0; i < rows; i++) {
-    result.push(byIndex.get(i) ?? { index: i, spans: [] });
-  }
-  return result;
-}
-
-// Shared cwd formatting utilities
-function formatCwdSimplified(cwd: string): string {
-  if (!cwd) return "~";
-  const home = "/Users/";
-  if (cwd.startsWith(home)) {
-    const rest = cwd.substring(home.length);
-    const slashIdx = rest.indexOf("/");
-    if (slashIdx >= 0) return "~" + rest.substring(slashIdx);
-    return "~";
-  }
-  return cwd;
-}
-
-function extractUsername(cwd: string): string {
-  if (!cwd) return "user";
-  const home = "/Users/";
-  if (cwd.startsWith(home)) {
-    const rest = cwd.substring(home.length);
-    const slashIdx = rest.indexOf("/");
-    return slashIdx >= 0 ? rest.substring(0, slashIdx) : rest;
-  }
-  return "user";
-}
-
-// Real hostname fetched from the OS via Tauri IPC
-let _cachedHostname = "localhost";
-
-// Fetch hostname at module load time
-fetchHostname().then((h) => { _cachedHostname = h; }).catch(() => {});
-
-function getHostname(): string {
-  return _cachedHostname;
-}
-
-// For default prompt: show just the last directory name, or ~ for home
-function formatCwdDefault(cwd: string): string {
-  if (!cwd) return "~";
-  const home = "/Users/";
-  if (cwd.startsWith(home)) {
-    const rest = cwd.substring(home.length);
-    const slashIdx = rest.indexOf("/");
-    if (slashIdx < 0) return "~"; // exactly at home
-    const afterHome = rest.substring(slashIdx + 1);
-    if (!afterHome) return "~";
-    // Return just the last path segment
-    const lastSlash = afterHome.lastIndexOf("/");
-    return lastSlash >= 0 ? afterHome.substring(lastSlash + 1) : afterHome;
-  }
-  // Not under /Users, show last segment
-  const lastSlash = cwd.lastIndexOf("/");
-  if (lastSlash >= 0 && lastSlash < cwd.length - 1) return cwd.substring(lastSlash + 1);
-  return cwd;
-}
-
-// Render a completed command block as a card
-const CommandBlock: Component<{
-  snapshot: CommandSnapshot;
-  charWidth: number;
-  promptStyle: "default" | "simplified" | "blank";
-}> = (props) => {
-  const [copied, setCopied] = createSignal<"command" | "output" | null>(null);
-
-  const displayCwd = () => {
-    const cwd = props.snapshot.cwd;
-    if (props.promptStyle === "blank") return "";
-    if (props.promptStyle === "default") return cwd || "~";
-    return formatCwdSimplified(cwd);
-  };
-
-  const duration = () => {
-    const end = props.snapshot.endTime;
-    if (!end) return null;
-    const ms = end - props.snapshot.timestamp;
-    if (ms < 1000) return `${ms}ms`;
-    return `${(ms / 1000).toFixed(3)}s`;
-  };
-
-  const timeStr = () => {
-    const d = new Date(props.snapshot.timestamp);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  };
-
-  const copyCommand = (e: MouseEvent) => {
-    e.stopPropagation();
-    if (props.snapshot.command) {
-      navigator.clipboard.writeText(props.snapshot.command).catch(console.error);
-      setCopied("command");
-      setTimeout(() => setCopied(null), 1500);
-    }
-  };
-
-  const copyOutput = (e: MouseEvent) => {
-    e.stopPropagation();
-    const text = props.snapshot.lines
-      .map((line) =>
-        line.spans
-          .map((s) => s.text)
-          .join("")
-          .trimEnd(),
-      )
-      .join("\n");
-    navigator.clipboard.writeText(text).catch(console.error);
-    setCopied("output");
-    setTimeout(() => setCopied(null), 1500);
-  };
-
-  return (
-    <div
-      class="command-block"
-      classList={{ "block-failed": props.snapshot.failed }}
-    >
-      {/* Floating action toolbar */}
-      <div class="block-actions">
-        <Show when={props.snapshot.command}>
-          <button
-            class="block-action-btn"
-            onClick={copyCommand}
-            title="Copy command"
-          >
-            <IconCommand size={12} />
-          </button>
-        </Show>
-        <Show when={props.snapshot.lines.length > 0}>
-          <button
-            class="block-action-btn"
-            onClick={copyOutput}
-            title="Copy output"
-          >
-            <IconCopy size={12} />
-          </button>
-        </Show>
-      </div>
-
-      <div class="block-header">
-        <span class="block-header-icon"><IconFolder size={11} /></span>
-        <span class="block-cwd">{displayCwd()}</span>
-        <Show when={duration()}>
-          <span class="block-duration">{duration()}</span>
-        </Show>
-        <span class="block-timestamp">{timeStr()}</span>
-      </div>
-
-      <Show when={props.snapshot.command}>
-        <div class="block-command">
-          <span class="block-prompt-char">$</span>
-          {props.snapshot.command}
-        </div>
-      </Show>
-
-      <Show when={props.snapshot.lines.length > 0}>
-        <div class="block-output">
-          <For each={props.snapshot.lines}>
-            {(line) => <TerminalLine line={line} charWidth={props.charWidth} />}
-          </For>
-        </div>
-      </Show>
-
-      {/* Footer for completed blocks with exit info */}
-      <Show when={props.snapshot.endTime !== null && props.snapshot.endTime !== undefined}>
-        <div class="block-footer">
-          <span class={`block-exit-code ${props.snapshot.failed ? "exit-error" : "exit-success"}`}>
-            {props.snapshot.failed ? "failed" : "ok"}
-          </span>
-          <Show when={duration()}>
-            <span class="block-duration">{duration()}</span>
-          </Show>
-          <button class="block-action" onClick={copyOutput}>
-            <IconCopy size={11} />
-            {copied() === "output" ? "copied!" : "copy"}
-          </button>
-        </div>
-      </Show>
-    </div>
-  );
-};
-
-// Traditional-style block: renders a snapshot as continuous lines without card chrome
-const TraditionalBlock: Component<{
-  snapshot: CommandSnapshot;
-  charWidth: number;
-  promptStyle: "default" | "simplified" | "blank";
-}> = (props) => {
-  const displayPrompt = () => {
-    const cwd = props.snapshot.cwd;
-    if (props.promptStyle === "blank") return null;
-    if (props.promptStyle === "default") {
-      const user = extractUsername(cwd);
-      const host = getHostname();
-      const dirName = formatCwdDefault(cwd);
-      return `${user}@${host} ${dirName}`;
-    }
-    return formatCwdSimplified(cwd);
-  };
-
-  const promptChar = () => {
-    if (props.promptStyle === "blank") return "";
-    if (props.promptStyle === "default") return "%";
-    return "$";
-  };
-
-  return (
-    <div class="traditional-block">
-      <Show when={props.snapshot.command}>
-        <div class="term-line traditional-prompt-line">
-          <Show when={displayPrompt()}>
-            <span class="traditional-prompt-text">{displayPrompt()}</span>
-            <span class="traditional-prompt-char"> {promptChar()} </span>
-          </Show>
-          <span class="traditional-command-text">{props.snapshot.command}</span>
-        </div>
-      </Show>
-      <Show when={props.snapshot.lines.length > 0}>
-        <For each={props.snapshot.lines}>
-          {(line) => <TerminalLine line={line} charWidth={props.charWidth} />}
-        </For>
-      </Show>
-    </div>
-  );
-};
-
-// Welcome screen for empty terminals
-const WelcomeState: Component = () => {
-  return (
-    <div class="welcome-state">
-      <div class="welcome-title">Rain</div>
-      <Show when={appVersion()}><div class="welcome-version">v{appVersion()}</div></Show>
-      <pre class="welcome-art">{`                                                   
-                  #                  
-                 ###                 
-               ######               
-              #########              
-             ###########             
-            ##############            
-          #################          
-         ###################         
-        #####################        
-       ###   #################       
-      #######   ###############      
-      ########   ##############      
-      #####   #################      
-      ############        #####      
-       #######################       
-        #####################        
-         ###################         
-           ###############           
-               #######               
-                                     `}</pre>
-      <div class="welcome-shortcuts">
-        <div class="welcome-shortcut">
-          <span class="welcome-key">Cmd+T</span>
-          <span>New tab</span>
-        </div>
-        <div class="welcome-shortcut">
-          <span class="welcome-key">Cmd+K</span>
-          <span>Clear</span>
-        </div>
-        <div class="welcome-shortcut">
-          <span class="welcome-key">Cmd+,</span>
-          <span>Settings</span>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-// Search bar for Cmd+F terminal search
-const SearchBar: Component<{
-  query: string;
-  matchCount: number;
-  currentIndex: number;
-  onQueryChange: (q: string) => void;
-  onNext: () => void;
-  onPrev: () => void;
-  onClose: () => void;
-}> = (props) => {
-  let inputRef!: HTMLInputElement;
-
-  onMount(() => {
-    inputRef?.focus();
-  });
-
-  const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      props.onClose();
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      if (e.shiftKey) {
-        props.onPrev();
-      } else {
-        props.onNext();
-      }
-    }
-  };
-
-  return (
-    <div class="search-bar">
-      <input
-        ref={inputRef}
-        type="text"
-        class="search-input"
-        placeholder="Search..."
-        value={props.query}
-        onInput={(e) => props.onQueryChange(e.currentTarget.value)}
-        onKeyDown={handleKeyDown}
-      />
-      <span class="search-count">
-        {props.matchCount > 0 ? `${props.currentIndex + 1}/${props.matchCount}` : "no matches"}
-      </span>
-      <button class="search-btn" onClick={props.onPrev} title="Previous (Shift+Enter)">&#x25B2;</button>
-      <button class="search-btn" onClick={props.onNext} title="Next (Enter)">&#x25BC;</button>
-      <button class="search-btn search-close" onClick={props.onClose} title="Close (Esc)">&times;</button>
-    </div>
-  );
-};
-
-export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpenSettings?: () => void }> = (props) => {
+export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpenSettings?: () => void; onSplitRight?: () => void; onSplitDown?: () => void }> = (props) => {
   let containerRef!: HTMLDivElement;
   let scrollRef!: HTMLDivElement;
+  let srAnnouncerRef: HTMLDivElement | undefined;
   const { config } = useConfig();
   const inputBuffer = createInputBuffer();
+
+  // Unified input sender: routes to tmux or PTY depending on pane type
+  const sendInput = (sessionId: string, data: number[]) => {
+    const tmuxPaneId = props.store.state.tmuxPaneId;
+    if (tmuxPaneId != null) {
+      return tmuxSendKeys(tmuxPaneId, data);
+    }
+    return writeInput(sessionId, data);
+  };
   const [metrics, setMetrics] = createSignal<FontMetrics | null>(null);
   const [isScrolledUp, setIsScrolledUp] = createSignal(false);
   const [containerHeight, setContainerHeight] = createSignal(600);
@@ -360,15 +50,17 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
   // Selection state for text selection
   const [selection, setSelection] = createSignal<SelectionState>(createSelectionState());
 
-  // Inline images from OSC 1337
-  const [inlineImages, setInlineImages] = createSignal<Array<{
-    id: string;
-    dataUri: string;
-    width: number;
-    height: number;
-    row: number;
-    col: number;
-  }>>([]);
+  const inlineImages = () => props.store.state.inlineImages;
+
+  // Context menu state
+  const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number; selectedText?: string; linkUrl?: string } | null>(null);
+
+  // Visual bell flash state
+  const [bellFlash, setBellFlash] = createSignal(false);
+
+  // Regex search toggle
+  const [searchUseRegex, setSearchUseRegex] = createSignal(false);
+  const [searchRegexError, setSearchRegexError] = createSignal(false);
 
   function isClearCommand(command: string): boolean {
     const trimmed = command.trim();
@@ -383,6 +75,10 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     setMetrics(m);
 
     containerRef.focus();
+    const onWindowFocus = () => emitFocusEvent(true);
+    const onWindowBlur = () => emitFocusEvent(false);
+    window.addEventListener("focus", onWindowFocus);
+    window.addEventListener("blur", onWindowBlur);
 
     // Horizontal padding on terminal-scroll (12px each side)
     const scrollPadding = 24;
@@ -408,7 +104,11 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
 
       resizeInFlight = true;
 
-      resizeTerminal(sid, rows, cols)
+      const tmuxPaneId = props.store.state.tmuxPaneId;
+      const resizeOp = tmuxPaneId != null
+        ? tmuxResizePane(tmuxPaneId, rows, cols)
+        : resizeTerminal(sid, rows, cols);
+      resizeOp
         .catch(console.error)
         .finally(() => {
           resizeInFlight = false;
@@ -499,6 +199,8 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     onCleanup(() => {
       observer.disconnect();
       if (resizeTimer !== null) clearTimeout(resizeTimer);
+      window.removeEventListener("focus", onWindowFocus);
+      window.removeEventListener("blur", onWindowBlur);
     });
   });
 
@@ -614,16 +316,29 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
 
   // Wheel handler for grid-level scrollback and alt screen forwarding
   const handleWheel = (e: WheelEvent) => {
-    // Alt screen: forward scroll as arrow keys to PTY
+    // Alt screen: honor mouse tracking first, then alternate scroll mode.
     if (props.store.state.altScreen) {
-      e.preventDefault();
       const sid = props.store.state.sessionId;
       if (!sid) return;
-      const lines = Math.max(1, Math.round(Math.abs(e.deltaY) / 20));
-      const arrow = e.deltaY < 0 ? "\x1b[A" : "\x1b[B";
-      const seq = arrow.repeat(lines);
-      const encoder = new TextEncoder();
-      writeInput(sid, Array.from(encoder.encode(seq))).catch(console.error);
+
+      if (props.store.state.mouseTracking) {
+        e.preventDefault();
+        const viewport = containerRef?.querySelector(".terminal-content, .alt-screen, .active-viewport, .terminal-history") as HTMLElement;
+        if (!viewport) return;
+        const { row, col } = pixelToGrid(e as unknown as MouseEvent, viewport);
+        const button = e.deltaY < 0 ? 64 : 65; // wheel up/down
+        sendInput(sid, encodeMouseEvent(button, col, row, true)).catch(console.error);
+        return;
+      }
+
+      if (props.store.state.altScroll) {
+        e.preventDefault();
+        const lines = Math.max(1, Math.round(Math.abs(e.deltaY) / 20));
+        const arrow = e.deltaY < 0 ? "\x1b[A" : "\x1b[B";
+        const seq = arrow.repeat(lines);
+        const encoder = new TextEncoder();
+        sendInput(sid, Array.from(encoder.encode(seq))).catch(console.error);
+      }
       return;
     }
 
@@ -703,12 +418,19 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
       lastMouseButton = mouseButtonId(e);
       const sid = props.store.state.sessionId;
       if (sid) {
-        writeInput(sid, encodeMouseEvent(lastMouseButton, col, row, true)).catch(console.error);
+        sendInput(sid, encodeMouseEvent(lastMouseButton, col, row, true)).catch(console.error);
       }
       return;
     }
 
     // Text selection
+    // Allow native browser selection for completed output blocks.
+    // Keep custom grid-based selection for the active viewport/alt-screen.
+    const target = e.target as HTMLElement;
+    if (target.closest(".command-block, .traditional-block")) {
+      containerRef?.focus();
+      return;
+    }
     e.preventDefault();
     containerRef?.focus();
     mouseButtonDown = true;
@@ -733,17 +455,18 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
   };
 
   const handleTermMouseMove = (e: MouseEvent) => {
-    if (!mouseButtonDown) return;
+    if (!mouseButtonDown && !props.store.state.mouseAllMotion) return;
     const viewport = containerRef?.querySelector(".terminal-content, .alt-screen, .active-viewport, .terminal-history") as HTMLElement;
     if (!viewport) return;
     const { row, col } = pixelToGrid(e, viewport);
 
-    // Mouse motion tracking
-    if (props.store.state.mouseMotion && props.store.state.mouseTracking && !e.shiftKey) {
+    // Mouse motion tracking (1002 drag, 1003 all-motion)
+    if ((props.store.state.mouseMotion || props.store.state.mouseAllMotion) && props.store.state.mouseTracking && !e.shiftKey) {
       const sid = props.store.state.sessionId;
       if (sid) {
-        const button = lastMouseButton + 32; // motion flag
-        writeInput(sid, encodeMouseEvent(button, col, row, true)).catch(console.error);
+        const baseButton = mouseButtonDown ? lastMouseButton : 3;
+        const button = baseButton + 32; // motion flag
+        sendInput(sid, encodeMouseEvent(button, col, row, true)).catch(console.error);
       }
       return;
     }
@@ -768,7 +491,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
       mouseButtonDown = false;
       const sid = props.store.state.sessionId;
       if (sid) {
-        writeInput(sid, encodeMouseEvent(lastMouseButton, col, row, false)).catch(console.error);
+        sendInput(sid, encodeMouseEvent(lastMouseButton, col, row, false)).catch(console.error);
       }
       return;
     }
@@ -840,24 +563,16 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     return all;
   }
 
-  // Focus/blur handlers for focus event reporting
-  const handleFocus = () => {
-    if (props.store.state.focusEvents) {
-      const sid = props.store.state.sessionId;
-      if (sid) {
-        writeInput(sid, [0x1b, 0x5b, 0x49]).catch(console.error); // \x1b[I
-      }
-    }
+  // Focus event reporting for DECSET 1004.
+  const emitFocusEvent = (focused: boolean) => {
+    if (!props.active || !props.store.state.focusEvents) return;
+    const sid = props.store.state.sessionId;
+    if (!sid) return;
+    sendInput(sid, focused ? [0x1b, 0x5b, 0x49] : [0x1b, 0x5b, 0x4f]).catch(console.error);
   };
 
-  const handleBlur = () => {
-    if (props.store.state.focusEvents) {
-      const sid = props.store.state.sessionId;
-      if (sid) {
-        writeInput(sid, [0x1b, 0x5b, 0x4f]).catch(console.error); // \x1b[O
-      }
-    }
-  };
+  const handleFocus = () => emitFocusEvent(true);
+  const handleBlur = () => emitFocusEvent(false);
 
   // Search functions
   function openSearch() {
@@ -875,28 +590,78 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     }));
   }
 
+  function exportScrollback() {
+    const lines: string[] = [];
+    // Collect all snapshot output
+    for (const snap of props.store.state.snapshots) {
+      if (snap.command) lines.push(`$ ${snap.command}`);
+      for (const line of snap.lines) {
+        lines.push(line.spans.map((s) => s.text).join("").trimEnd());
+      }
+      lines.push("");
+    }
+    // Add current visible lines
+    const fallback = props.store.state.fallbackLines;
+    for (const line of fallback) {
+      lines.push(line.spans.map((s) => s.text).join("").trimEnd());
+    }
+
+    const text = lines.join("\n");
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    saveTextToFile(text, `rain-export-${timestamp}.txt`).catch(console.error);
+  }
+
   function updateSearchQuery(query: string) {
     props.store.setState(produce((s) => {
       s.searchQuery = query;
       if (!query) {
         s.searchMatches = [];
         s.searchCurrentIndex = -1;
+        setSearchRegexError(false);
         return;
       }
 
       const matches: SearchMatch[] = [];
-      const lowerQuery = query.toLowerCase();
+      const useRegex = searchUseRegex();
       const lines = getAllDisplayLines();
-      for (const line of lines) {
-        const text = line.spans.map((sp) => sp.text).join("").toLowerCase();
-        let idx = 0;
-        while ((idx = text.indexOf(lowerQuery, idx)) !== -1) {
-          matches.push({
-            globalRow: line.index,
-            startCol: idx,
-            endCol: idx + query.length - 1,
-          });
-          idx += 1;
+
+      if (useRegex) {
+        let re: RegExp;
+        try {
+          re = new RegExp(query, "gi");
+          setSearchRegexError(false);
+        } catch {
+          setSearchRegexError(true);
+          s.searchMatches = [];
+          s.searchCurrentIndex = -1;
+          return;
+        }
+        for (const line of lines) {
+          const text = line.spans.map((sp) => sp.text).join("");
+          let m: RegExpExecArray | null;
+          re.lastIndex = 0;
+          while ((m = re.exec(text)) !== null) {
+            if (m[0].length === 0) { re.lastIndex++; continue; }
+            matches.push({
+              globalRow: line.index,
+              startCol: m.index,
+              endCol: m.index + m[0].length - 1,
+            });
+          }
+        }
+      } else {
+        const lowerQuery = query.toLowerCase();
+        for (const line of lines) {
+          const text = line.spans.map((sp) => sp.text).join("").toLowerCase();
+          let idx = 0;
+          while ((idx = text.indexOf(lowerQuery, idx)) !== -1) {
+            matches.push({
+              globalRow: line.index,
+              startCol: idx,
+              endCol: idx + query.length - 1,
+            });
+            idx += 1;
+          }
         }
       }
       s.searchMatches = matches;
@@ -918,12 +683,72 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     }));
   }
 
-  // Handle inline image events
+  // Screen reader announcement helper
+  function announce(message: string) {
+    if (srAnnouncerRef) {
+      srAnnouncerRef.textContent = "";
+      requestAnimationFrame(() => {
+        if (srAnnouncerRef) srAnnouncerRef.textContent = message;
+      });
+    }
+  }
+
+  // Announce command completion to screen readers
   createEffect(on(
-    () => props.store.state.lastFrameSeq,
-    () => {
-      // Check for image events - we handle them here instead of in the store
-      // since they need DOM rendering
+    () => props.store.state.snapshots.length,
+    (len, prevLen) => {
+      if (prevLen !== undefined && len > prevLen) {
+        const snap = props.store.state.snapshots[len - 1];
+        if (snap?.command) {
+          announce(`Command ${snap.command} ${snap.failed ? "failed" : "completed"}`);
+        }
+      }
+    }
+  ));
+
+  // Announce CWD changes to screen readers
+  createEffect(on(
+    () => props.store.state.cwd,
+    (cwd, prevCwd) => {
+      if (prevCwd !== undefined && cwd !== prevCwd && cwd) {
+        announce(`Directory changed to ${cwd}`);
+      }
+    }
+  ));
+
+  // Clear inline images when entering alt screen (fullscreen TUIs redraw everything)
+  createEffect(on(
+    () => props.store.state.altScreen,
+    (alt) => {
+      if (alt && inlineImages().length > 0) {
+        props.store.setState("inlineImages", []);
+      }
+    },
+  ));
+
+  // Visual bell: flash the terminal border briefly
+  createEffect(() => {
+    const bell = props.store.state.bell;
+    if (bell) {
+      setBellFlash(true);
+      const timerId = setTimeout(() => setBellFlash(false), 150);
+      onCleanup(() => clearTimeout(timerId));
+      untrack(() => {
+        props.store.setState(produce((s) => { s.bell = false; }));
+      });
+    }
+  });
+
+  createEffect(on(
+    () => props.store.state.tmuxCompatibilityNotice,
+    (visible) => {
+      if (!visible) return;
+      const timerId = setTimeout(() => {
+        props.store.setState(produce((s) => {
+          s.tmuxCompatibilityNotice = false;
+        }));
+      }, 2800);
+      onCleanup(() => clearTimeout(timerId));
     },
   ));
 
@@ -962,7 +787,8 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
   });
 
   // TUI render mode helpers (must be above memos that reference them)
-  const isTraditional = () => config().terminalStyle === "traditional";
+  const tmuxForcesTraditional = () => config().terminalStyle === "chat" && props.store.state.tmuxActive;
+  const isTraditional = () => config().terminalStyle === "traditional" || tmuxForcesTraditional();
   const promptStyle = () => config().promptStyle;
   const fullscreenTui = () => props.store.state.altScreen && config().clearHistoryForTuis;
   const inlineTui = () => props.store.state.altScreen && !config().clearHistoryForTuis;
@@ -1099,7 +925,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     if (!sid) return;
     const encoder = new TextEncoder();
     const bytes = encoder.encode(text + "\r");
-    writeInput(sid, Array.from(bytes)).catch(console.error);
+    sendInput(sid, Array.from(bytes)).catch(console.error);
   }
 
   // Send raw bytes to PTY (for alt screen mode)
@@ -1107,9 +933,9 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     const sid = props.store.state.sessionId;
     if (!sid) return;
     const cfg = config();
-    const bytes = keyEventToBytes(e, cfg.optionAsMeta);
+    const bytes = keyEventToBytes(e, cfg.optionAsMeta, props.store.state.cursorKeysApplication);
     if (bytes.length > 0) {
-      writeInput(sid, Array.from(bytes)).catch(console.error);
+      sendInput(sid, Array.from(bytes)).catch(console.error);
     }
   }
 
@@ -1128,38 +954,61 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     data.set(clearLine, 0);
     data.set(bufferBytes, clearLine.length);
     data.set(tabByte, clearLine.length + bufferBytes.length);
-    writeInput(sid, Array.from(data)).catch(console.error);
+    sendInput(sid, Array.from(data)).catch(console.error);
     setWaitingForTab(true);
   }
 
   // Key handler - split between local buffer (normal) and raw PTY (alt screen)
   const handleKeyDown = (e: KeyboardEvent) => {
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+
     // App shortcuts always pass through
-    if (e.metaKey && e.key === "k") {
+    if (matchesKeybinding(e, "clear")) {
       e.preventDefault();
       props.store.clearHistory();
       return;
     }
-    if (e.metaKey && e.key === ",") {
+    if (matchesKeybinding(e, "settings")) {
       e.preventDefault();
       props.onOpenSettings?.();
       return;
     }
-    if (e.metaKey && (e.key === "t" || e.key === "w" || (e.key >= "1" && e.key <= "9"))) {
+    if (
+      matchesKeybinding(e, "new-tab") ||
+      matchesKeybinding(e, "close-tab") ||
+      matchesKeybinding(e, "close-pane") ||
+      matchesKeybinding(e, "next-tab") ||
+      matchesKeybinding(e, "prev-tab") ||
+      matchesKeybinding(e, "split-horizontal") ||
+      matchesKeybinding(e, "split-vertical") ||
+      matchesKeybinding(e, "command-palette")
+    ) {
       return;
     }
-    if (e.metaKey && e.shiftKey && (e.key === "[" || e.key === "]")) {
+    if ((e.metaKey || e.ctrlKey) && key >= "1" && key <= "9") {
+      for (let i = 1; i <= 9; i++) {
+        if (matchesKeybinding(e, `tab-${i}`)) return;
+      }
+    }
+    if (e.metaKey && e.shiftKey && (key === "[" || key === "]")) {
       return;
     }
 
     // Cmd+F: toggle search
-    if (e.metaKey && e.key === "f") {
+    if (matchesKeybinding(e, "search")) {
       e.preventDefault();
       if (props.store.state.searchOpen) {
         closeSearch();
       } else {
         openSearch();
       }
+      return;
+    }
+
+    // Cmd+S: Export scrollback
+    if (e.metaKey && key === "s" && !e.shiftKey && !e.ctrlKey) {
+      e.preventDefault();
+      exportScrollback();
       return;
     }
 
@@ -1186,7 +1035,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     }
 
     // Cmd+C with active selection: copy selected text
-    if (e.metaKey && e.key === "c") {
+    if (e.metaKey && key === "c") {
       const sel = selection();
       if (sel.active && sel.range) {
         e.preventDefault();
@@ -1211,11 +1060,11 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     // Alt screen or running command: raw PTY mode
     // (local buffer only active at the prompt, not while a command executes)
     if (props.store.state.altScreen || props.store.state.activeBlock) {
-      if (e.metaKey && e.key === "c") {
+      if (e.metaKey && key === "c") {
         const sel = window.getSelection();
         if (sel && sel.toString().length > 0) return;
       }
-      if (e.metaKey && e.key === "v") return;
+      if (e.metaKey && key === "v") return;
 
       e.preventDefault();
       sendRawBytes(e);
@@ -1230,14 +1079,14 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     resetBlink();
 
     // Cmd+A: select all in buffer
-    if (e.metaKey && e.key === "a") {
+    if (e.metaKey && key === "a") {
       e.preventDefault();
       inputBuffer.selectAll();
       return;
     }
 
     // Cmd+C: copy selection from buffer
-    if (e.metaKey && e.key === "c") {
+    if (e.metaKey && key === "c") {
       e.preventDefault();
       const text = inputBuffer.getSelectedText();
       if (text) {
@@ -1247,13 +1096,13 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     }
 
     // Cmd+V: paste into buffer
-    if (e.metaKey && e.key === "v") {
+    if (e.metaKey && key === "v") {
       // Let the paste event handler deal with it
       return;
     }
 
     // Cmd+X: cut selection
-    if (e.metaKey && e.key === "x") {
+    if (e.metaKey && key === "x") {
       e.preventDefault();
       const text = inputBuffer.getSelectedText();
       if (text) {
@@ -1264,24 +1113,24 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     }
 
     // Ctrl+C: send interrupt to PTY and clear buffer
-    if (e.ctrlKey && e.key === "c") {
+    if (e.ctrlKey && key === "c") {
       e.preventDefault();
-      writeInput(sid, [0x03]).catch(console.error); // ETX
+      sendInput(sid, [0x03]).catch(console.error); // ETX
       inputBuffer.clear();
       return;
     }
 
     // Ctrl+D: send EOF
-    if (e.ctrlKey && e.key === "d") {
+    if (e.ctrlKey && key === "d") {
       e.preventDefault();
-      writeInput(sid, [0x04]).catch(console.error); // EOT
+      sendInput(sid, [0x04]).catch(console.error); // EOT
       return;
     }
 
     // Ctrl+L: clear screen
     if (e.ctrlKey && e.key === "l") {
       e.preventDefault();
-      writeInput(sid, [0x0c]).catch(console.error);
+      sendInput(sid, [0x0c]).catch(console.error);
       return;
     }
 
@@ -1386,19 +1235,32 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     const text = e.clipboardData?.getData("text");
     if (!text) return;
 
+    const safetyCheck = checkPasteContent(text);
+    if (safetyCheck.isSuspicious) {
+      const confirmed = window.confirm(
+        `${safetyCheck.reason}\n\nAre you sure you want to paste this?`
+      );
+      if (!confirmed) return;
+    }
+
     if (props.store.state.altScreen || props.store.state.activeBlock) {
-      // Alt screen or running command: bracketed paste to PTY
+      // Alt screen or running command: send paste to PTY
       const sid = props.store.state.sessionId;
       if (!sid) return;
       const encoder = new TextEncoder();
-      const pasteStart = new Uint8Array([0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e]);
-      const pasteEnd = new Uint8Array([0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e]);
       const textBytes = encoder.encode(text);
-      const data = new Uint8Array(pasteStart.length + textBytes.length + pasteEnd.length);
-      data.set(pasteStart, 0);
-      data.set(textBytes, pasteStart.length);
-      data.set(pasteEnd, pasteStart.length + textBytes.length);
-      writeInput(sid, Array.from(data)).catch(console.error);
+      if (props.store.state.bracketedPaste) {
+        // Wrap in bracketed paste delimiters when mode 2004 is active
+        const pasteStart = new Uint8Array([0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e]);
+        const pasteEnd = new Uint8Array([0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e]);
+        const data = new Uint8Array(pasteStart.length + textBytes.length + pasteEnd.length);
+        data.set(pasteStart, 0);
+        data.set(textBytes, pasteStart.length);
+        data.set(pasteEnd, pasteStart.length + textBytes.length);
+        sendInput(sid, Array.from(data)).catch(console.error);
+      } else {
+        sendInput(sid, Array.from(textBytes)).catch(console.error);
+      }
     } else {
       // Normal mode: insert into local buffer
       inputBuffer.insert(text);
@@ -1518,8 +1380,12 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     <div
       ref={containerRef}
       class="terminal-container"
-      classList={{ "terminal-hidden": !props.active, "terminal-traditional": isTraditional() }}
+      classList={{ "terminal-hidden": !props.active, "terminal-traditional": isTraditional(), "terminal-bell-flash": bellFlash() }}
+      role="application"
+      aria-label="Terminal"
+      aria-roledescription="terminal emulator"
       tabIndex={0}
+      data-ligatures={config().enableLigatures ? "true" : "false"}
       onKeyDown={handleKeyDown}
       onPaste={handlePaste}
       onFocus={handleFocus}
@@ -1528,6 +1394,21 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
       onMouseMove={handleTermMouseMove}
       onMouseUp={handleTermMouseUp}
       onWheel={handleWheel}
+      onContextMenu={(e: MouseEvent) => {
+        e.preventDefault();
+        let selectedText: string | undefined;
+        const sel = selection();
+        if (sel.active && sel.range) {
+          const lines = getAllDisplayLines();
+          selectedText = extractSelectedText(lines, sel.range) || undefined;
+        }
+        let linkUrl: string | undefined;
+        const target = e.target as HTMLElement;
+        if (target.classList.contains("term-url")) {
+          linkUrl = target.dataset.url || target.textContent || undefined;
+        }
+        setContextMenu({ x: e.clientX, y: e.clientY, selectedText, linkUrl });
+      }}
       style={{
         "font-family": fontFamily(),
         "font-size": `${fontSize()}px`,
@@ -1535,17 +1416,42 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
         "letter-spacing": `${config().letterSpacing}px`,
       }}
     >
+      {/* Screen reader announcements */}
+      <div
+        class="sr-only"
+        role="alert"
+        aria-live="assertive"
+        aria-atomic="true"
+        ref={(el) => { srAnnouncerRef = el; }}
+      />
       {/* Search bar */}
       <Show when={props.store.state.searchOpen}>
         <SearchBar
           query={props.store.state.searchQuery}
           matchCount={props.store.state.searchMatches.length}
           currentIndex={props.store.state.searchCurrentIndex}
+          useRegex={searchUseRegex()}
+          regexError={searchRegexError()}
           onQueryChange={updateSearchQuery}
           onNext={searchNext}
           onPrev={searchPrev}
           onClose={closeSearch}
+          onToggleRegex={() => {
+            setSearchUseRegex((v) => !v);
+            updateSearchQuery(props.store.state.searchQuery);
+          }}
         />
+      </Show>
+      {/* Disconnected/error banner */}
+      <Show when={props.store.state.sessionId && !props.store.state.connected}>
+        <div class="terminal-disconnected-banner">
+          Session ended
+        </div>
+      </Show>
+      <Show when={props.store.state.tmuxCompatibilityNotice}>
+        <div class="terminal-compat-banner">
+          tmux running in compatibility mode (use Rain's native integration with Cmd+Shift+T)
+        </div>
       </Show>
       {/* Fullscreen TUI: absolute overlay when setting is enabled */}
       <Show when={fullscreenTui()}>
@@ -1576,6 +1482,9 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
         <div
           class="terminal-scroll"
           ref={scrollRef}
+          role="log"
+          aria-live="polite"
+          aria-label="Terminal output"
           onScroll={handleScroll}
           style={{
             "overflow-y": (props.store.state.activeBlock && !inlineTui() && !keepHistoryDuringPrimaryActive())
@@ -1659,6 +1568,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
               <Show when={isTraditional() && !inlineTui() && !props.store.state.activeBlock}>
                 <div
                   class="traditional-input-line"
+                  aria-label="Terminal input"
                   onClick={handleLocalInputClick}
                   onDblClick={handleLocalInputDblClick}
                 >
@@ -1749,6 +1659,33 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
           </Show>
         </div>
 
+        {/* Inline images from image protocols */}
+        <Show when={inlineImages().length > 0}>
+          <div class="inline-images-overlay" style={{ position: "relative" }}>
+            <For each={inlineImages()}>
+              {(img) => (
+                <div
+                  class="inline-image"
+                  style={{
+                    "max-width": img.width > 0 ? `${img.width}px` : "100%",
+                  }}
+                >
+                  <img
+                    src={img.dataUri}
+                    alt="Terminal inline image"
+                    style={{
+                      "max-width": "100%",
+                      height: "auto",
+                      "border-radius": "4px",
+                    }}
+                    loading="lazy"
+                  />
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
+
         {/* Scroll-to-bottom FAB */}
         <Show when={!inlineTui() && (!props.store.state.activeBlock || keepHistoryDuringPrimaryActive())}>
           <button
@@ -1781,6 +1718,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
             </Show>
             <div
               class="input-content"
+              aria-label="Terminal input"
               style={{ "max-height": `${Math.floor(containerHeight() * 0.3)}px` }}
               onClick={handleLocalInputClick}
               onDblClick={handleLocalInputDblClick}
@@ -1816,6 +1754,92 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
         </Show>
       </Show>
 
+      {/* Right-click context menu */}
+      <Show when={contextMenu()}>
+        {(pos) => (
+          <ContextMenu
+            x={pos().x}
+            y={pos().y}
+            hasSelection={selection().active}
+            selectedText={pos().selectedText}
+            linkUrl={pos().linkUrl}
+            onCopy={() => {
+              const sel = selection();
+              if (sel.active && sel.range) {
+                const lines = getAllDisplayLines();
+                const text = extractSelectedText(lines, sel.range);
+                if (text) navigator.clipboard.writeText(text).catch(console.error);
+              }
+              setContextMenu(null);
+            }}
+            onPaste={async () => {
+              try {
+                const text = await navigator.clipboard.readText();
+                if (text) {
+                  if (props.store.state.altScreen || props.store.state.activeBlock) {
+                    const sid = props.store.state.sessionId;
+                    if (sid) {
+                      const encoder = new TextEncoder();
+                      if (props.store.state.bracketedPaste) {
+                        const wrapped = "\x1b[200~" + text + "\x1b[201~";
+                        sendInput(sid, Array.from(encoder.encode(wrapped))).catch(console.error);
+                      } else {
+                        sendInput(sid, Array.from(encoder.encode(text))).catch(console.error);
+                      }
+                    }
+                  } else {
+                    inputBuffer.insert(text);
+                  }
+                }
+              } catch (e) { console.error(e); }
+              setContextMenu(null);
+            }}
+            onClear={() => {
+              props.store.clearHistory();
+              setContextMenu(null);
+            }}
+            onSelectAll={() => {
+              const lines = getAllDisplayLines();
+              if (lines.length > 0) {
+                const lastLine = lines[lines.length - 1];
+                const lastText = lastLine.spans.map(s => s.text).join("");
+                setSelection({
+                  active: true,
+                  range: { start: { row: 0, col: 0 }, end: { row: lastLine.index, col: Math.max(0, lastText.length - 1) } },
+                  selecting: false,
+                });
+              }
+              setContextMenu(null);
+            }}
+            onSearchSelection={() => {
+              const text = pos().selectedText;
+              if (text) {
+                openSearch();
+                updateSearchQuery(text);
+              }
+              setContextMenu(null);
+            }}
+            onOpenLink={() => {
+              const url = pos().linkUrl;
+              if (url) window.open(url, "_blank");
+              setContextMenu(null);
+            }}
+            onSplitRight={() => {
+              props.onSplitRight?.();
+              setContextMenu(null);
+            }}
+            onSplitDown={() => {
+              props.onSplitDown?.();
+              setContextMenu(null);
+            }}
+            onExport={() => {
+              exportScrollback();
+              setContextMenu(null);
+            }}
+            onClose={() => setContextMenu(null)}
+          />
+        )}
+      </Show>
     </div>
   );
 };

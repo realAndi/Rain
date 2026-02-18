@@ -62,7 +62,11 @@ impl StyledSpan {
         };
 
         // SGR 8 (HIDDEN): make text invisible by matching fg to bg
-        let fg = if attrs.contains(CellAttrs::HIDDEN) { bg } else { fg };
+        let fg = if attrs.contains(CellAttrs::HIDDEN) {
+            bg
+        } else {
+            fg
+        };
 
         Self {
             text: text.to_string(),
@@ -114,9 +118,7 @@ pub enum TerminalEvent {
         global_row: u64,
     },
     /// Terminal title changed (via OSC 0 or OSC 2)
-    TitleChanged {
-        title: String,
-    },
+    TitleChanged { title: String },
     /// Entered alternate screen buffer (e.g. vim, less)
     AltScreenEntered,
     /// Exited alternate screen buffer
@@ -124,15 +126,19 @@ pub enum TerminalEvent {
     /// Bell character received
     Bell,
     /// Working directory changed
-    CwdChanged {
-        path: String,
-    },
+    CwdChanged { path: String },
     /// Mouse mode flags changed
     MouseModeChanged {
         tracking: bool,
         motion: bool,
+        all_motion: bool,
         sgr: bool,
+        utf8: bool,
         focus: bool,
+        alt_scroll: bool,
+        synchronized_output: bool,
+        bracketed_paste: bool,
+        cursor_keys_application: bool,
     },
     /// Scrollback buffer was cleared (CSI 3J)
     ScrollbackCleared,
@@ -145,4 +151,29 @@ pub enum TerminalEvent {
         row: u16,
         col: u16,
     },
+    /// Sixel image data (experimental; only emitted when
+    /// RAIN_ENABLE_EXPERIMENTAL_IMAGE_PROTOCOLS=1).
+    SixelImage {
+        id: String,
+        data_base64: String,
+        width: u32,
+        height: u32,
+        row: u16,
+        col: u16,
+    },
+    /// Kitty graphics protocol image (experimental scaffold).
+    KittyImage {
+        id: String,
+        action: String,
+        data_base64: String,
+        width: u32,
+        height: u32,
+        row: u16,
+        col: u16,
+        image_id: u32,
+        placement_id: u32,
+    },
+    /// The shell hook intercepted a `tmux` command and requests Rain handle it
+    /// via control mode. `args` contains the raw arguments (e.g. "attach -t main").
+    TmuxRequested { args: String },
 }

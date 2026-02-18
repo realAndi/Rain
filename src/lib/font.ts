@@ -46,10 +46,11 @@ export function measureFontMetrics(
   // white-space: pre matches .term-span / .term-line so layout is identical.
   const probe = document.createElement("span");
   probe.style.cssText = [
-    `font-family: "${fontFamily}", monospace`,
+    `font-family: "${fontFamily}", "Rain Symbols Fallback", monospace`,
     `font-size: ${fontSize}px`,
     `line-height: ${lineHeight}px`,
     `letter-spacing: ${letterSpacing}px`,
+    `font-variant-ligatures: contextual`,
     `white-space: pre`,
     `position: absolute`,
     `visibility: hidden`,

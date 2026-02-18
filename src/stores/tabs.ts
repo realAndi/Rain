@@ -1,6 +1,14 @@
 import { createStore, produce } from "solid-js/store";
 import { createTerminalStore, type TerminalStore } from "./terminal";
-import type { TabData, PaneNode, PaneLeaf, PaneSplit } from "../lib/types";
+import type {
+  TabData,
+  PaneNode,
+  PaneLeaf,
+  PaneSplit,
+  TabTransferManifest,
+  TabTransferPaneNode,
+} from "../lib/types";
+import type { TmuxLayoutTree } from "../lib/ipc";
 
 export interface Tab {
   data: TabData;
@@ -15,7 +23,8 @@ export interface TabsState {
 export interface TabsStore {
   state: TabsState;
   stores: Map<string, TerminalStore>;
-  addTab: (sessionId: string, label?: string) => Tab;
+  addTab: (sessionId: string, label?: string, insertAt?: number, initialCwd?: string) => Tab;
+  addTabFromManifest: (manifest: TabTransferManifest, insertAt?: number) => Tab | null;
   addSettingsTab: () => void;
   closeTab: (tabId: string) => void;
   switchTab: (index: number) => void;
@@ -34,6 +43,15 @@ export interface TabsStore {
   getActivePaneId: (tabId: string) => string;
   getPaneTree: (tabId: string) => PaneNode | undefined;
   moveTab: (fromIndex: number, toIndex: number) => void;
+  addTmuxPane: (sessionId: string, paneId: number) => TerminalStore | null;
+  removeTmuxTabs: () => void;
+  rebuildTmuxLayout: (windowId: number, layoutTree: TmuxLayoutTree) => void;
+  replaceTabSession: (tabId: string, newSessionId: string) => void;
+  detachTab: (tabId: string) => { sessionId: string; label: string; cwd: string } | null;
+  updateTabColor: (tabId: string, color: string | null) => void;
+  popClosedTab: () => { cwd: string; label: string; customLabel: string | null; tabColor: string | null } | null;
+  getTabsExcept: (tabId: string) => string[];
+  getTabsToRight: (tabId: string) => string[];
 }
 
 let tabCounter = 0;
@@ -44,6 +62,9 @@ export function createTabsStore(): TabsStore {
     activeIndex: 0,
   });
 
+  const closedTabsStack: Array<{ cwd: string; label: string; customLabel: string | null; tabColor: string | null }> = [];
+  const MAX_CLOSED_TABS = 10;
+
   // Map of tabId -> TerminalStore (stores can't live in solid-js/store)
   const stores = new Map<string, TerminalStore>();
   // Map of sessionId -> tabId for routing render frames
@@ -51,11 +72,17 @@ export function createTabsStore(): TabsStore {
 
   let paneCounter = 0;
 
-  function addTab(sessionId: string, label?: string): Tab {
+  function addTab(
+    sessionId: string,
+    label?: string,
+    insertAt?: number,
+    initialCwd?: string,
+  ): Tab {
     const id = `tab-${++tabCounter}`;
     const paneId = `pane-${++paneCounter}`;
     const store = createTerminalStore();
-    store.setState({ sessionId, connected: true });
+    const startingCwd = initialCwd ?? "";
+    store.setState({ sessionId, connected: true, cwd: startingCwd });
 
     const paneTree: PaneLeaf = {
       type: "leaf",
@@ -69,9 +96,10 @@ export function createTabsStore(): TabsStore {
       label: label ?? "Shell",
       customLabel: null,
       sessionId,
-      cwd: "",
+      cwd: startingCwd,
       paneTree,
       activePaneId: paneId,
+      tabColor: null,
     };
 
     stores.set(paneId, store);
@@ -79,12 +107,108 @@ export function createTabsStore(): TabsStore {
 
     setState(
       produce((s) => {
-        s.tabs.push(tabData);
-        s.activeIndex = s.tabs.length - 1;
+        if (insertAt != null && insertAt >= 0 && insertAt <= s.tabs.length) {
+          s.tabs.splice(insertAt, 0, tabData);
+          s.activeIndex = insertAt;
+        } else {
+          s.tabs.push(tabData);
+          s.activeIndex = s.tabs.length - 1;
+        }
       }),
     );
 
     return { data: tabData, store };
+  }
+
+  function addTabFromManifest(manifest: TabTransferManifest, insertAt?: number): Tab | null {
+    const id = `tab-${++tabCounter}`;
+    const paneSessions = new Map(manifest.paneSessions.map((pane) => [pane.sessionId, pane.state]));
+    const createdPaneIds: string[] = [];
+    const createdSessionIds: string[] = [];
+    const sessionToPane = new Map<string, string>();
+
+    const cleanup = () => {
+      for (const paneId of createdPaneIds) stores.delete(paneId);
+      for (const sessionId of createdSessionIds) sessionToTab.delete(sessionId);
+    };
+
+    const clampRatio = (ratio: number): number => {
+      if (!Number.isFinite(ratio)) return 0.5;
+      return Math.max(0.1, Math.min(0.9, ratio));
+    };
+
+    const buildNode = (node: TabTransferPaneNode): PaneNode | null => {
+      if (node.type === "leaf") {
+        if (!node.sessionId) return null;
+        const paneId = `pane-${++paneCounter}`;
+        const store = createTerminalStore();
+        const initialCwd = paneSessions.get(node.sessionId)?.cwd?.trim() || manifest.cwd || "";
+        store.setState({ sessionId: node.sessionId, connected: true, cwd: initialCwd });
+        stores.set(paneId, store);
+        sessionToTab.set(node.sessionId, paneId);
+        createdPaneIds.push(paneId);
+        createdSessionIds.push(node.sessionId);
+        sessionToPane.set(node.sessionId, paneId);
+        return {
+          type: "leaf",
+          id: paneId,
+          sessionId: node.sessionId,
+        };
+      }
+
+      const first = buildNode(node.first);
+      const second = buildNode(node.second);
+      if (!first || !second) return null;
+      return {
+        type: "split",
+        id: `split-${++paneCounter}`,
+        direction: node.direction === "vertical" ? "vertical" : "horizontal",
+        ratio: clampRatio(node.ratio),
+        first,
+        second,
+      };
+    };
+
+    const paneTree = buildNode(manifest.paneTree);
+    if (!paneTree || sessionToPane.size === 0) {
+      cleanup();
+      return null;
+    }
+
+    const fallbackLeaf = firstLeaf(paneTree);
+    const activePaneId =
+      sessionToPane.get(manifest.activeSessionId) ??
+      sessionToPane.get(manifest.paneSessions[0]?.sessionId ?? "") ??
+      fallbackLeaf.id;
+    const tabData: TabData = {
+      id,
+      type: "terminal",
+      label: manifest.label || "Shell",
+      customLabel: manifest.customLabel ?? null,
+      sessionId: fallbackLeaf.sessionId,
+      cwd: manifest.cwd || "",
+      paneTree,
+      activePaneId,
+    };
+
+    setState(
+      produce((s) => {
+        if (insertAt != null && insertAt >= 0 && insertAt <= s.tabs.length) {
+          s.tabs.splice(insertAt, 0, tabData);
+          s.activeIndex = insertAt;
+        } else {
+          s.tabs.push(tabData);
+          s.activeIndex = s.tabs.length - 1;
+        }
+      }),
+    );
+
+    const activeStore = stores.get(activePaneId) ?? stores.get(fallbackLeaf.id);
+    if (!activeStore) {
+      cleanup();
+      return null;
+    }
+    return { data: tabData, store: activeStore };
   }
 
   function addSettingsTab() {
@@ -128,6 +252,16 @@ export function createTabsStore(): TabsStore {
   function closeTab(tabId: string) {
     const tabData = state.tabs.find((t) => t.id === tabId);
     if (!tabData) return;
+
+    if (tabData.type === "terminal") {
+      closedTabsStack.push({
+        cwd: tabData.cwd,
+        label: tabData.label,
+        customLabel: tabData.customLabel,
+        tabColor: tabData.tabColor ?? null,
+      });
+      if (closedTabsStack.length > MAX_CLOSED_TABS) closedTabsStack.shift();
+    }
 
     const idx = state.tabs.findIndex((t) => t.id === tabId);
 
@@ -384,6 +518,335 @@ export function createTabsStore(): TabsStore {
     return tab?.paneTree;
   }
 
+  function addTmuxPane(sessionId: string, tmuxPaneId: number): TerminalStore | null {
+    // Register the store so render frames can route to it.
+    // The actual split tree will be built by rebuildTmuxLayout when LayoutChanged fires.
+    const rainPaneId = getOrCreatePaneForSession(sessionId, tmuxPaneId);
+
+    // If a tab is already marked as tmux, just register the store (no new tab).
+    const existingTmuxTab = state.tabs.find((t) => t.tmuxSessionName != null);
+    if (existingTmuxTab) {
+      return stores.get(rainPaneId) ?? null;
+    }
+
+    // First tmux pane: mark the CURRENT active tab as the tmux tab instead of
+    // creating a new one. This gives the iTerm2-like feel where tmux takes over
+    // the current tab and the status bar indicates tmux is active.
+    const currentTab = activeTab();
+    if (currentTab && currentTab.type === "terminal") {
+      // Clean up the old PTY pane store for the current tab's leaf
+      const oldPaneId = currentTab.activePaneId || (currentTab.paneTree ? firstLeaf(currentTab.paneTree).id : "");
+      const oldStore = stores.get(oldPaneId);
+      if (oldStore?.state.sessionId) {
+        sessionToTab.delete(oldStore.state.sessionId);
+      }
+      stores.delete(oldPaneId);
+
+      // Replace the tab's pane tree with the tmux pane
+      const paneTree: PaneLeaf = {
+        type: "leaf",
+        id: rainPaneId,
+        sessionId,
+      };
+
+      setState(
+        produce((s) => {
+          const t = s.tabs.find((t) => t.id === currentTab.id);
+          if (t) {
+            t.paneTree = paneTree;
+            t.activePaneId = rainPaneId;
+            t.tmuxSessionName = "tmux";
+            t.tmuxWindowId = 0;
+            t.sessionId = sessionId;
+          }
+        }),
+      );
+
+      return stores.get(rainPaneId) ?? null;
+    }
+
+    // Fallback: no active terminal tab, create a new one
+    const id = `tab-${++tabCounter}`;
+    const paneTree: PaneLeaf = {
+      type: "leaf",
+      id: rainPaneId,
+      sessionId,
+    };
+
+    const tabData: TabData = {
+      id,
+      type: "terminal",
+      label: "tmux",
+      customLabel: null,
+      sessionId,
+      cwd: "",
+      paneTree,
+      activePaneId: rainPaneId,
+      tmuxSessionName: "tmux",
+      tmuxWindowId: 0,
+    };
+
+    setState(
+      produce((s) => {
+        s.tabs.push(tabData);
+        s.activeIndex = s.tabs.length - 1;
+      }),
+    );
+
+    return stores.get(rainPaneId) ?? null;
+  }
+
+  function removeTmuxTabs() {
+    const tmuxTabs = state.tabs.filter((t) => t.tmuxSessionName != null);
+    for (const tab of tmuxTabs) {
+      // Clean up tmux pane stores
+      if (tab.paneTree) {
+        for (const pid of collectLeafIds(tab.paneTree)) {
+          const store = stores.get(pid);
+          if (store?.state.sessionId) {
+            sessionToTab.delete(store.state.sessionId);
+            tmuxSessionToPaneId.delete(store.state.sessionId);
+          }
+          stores.delete(pid);
+        }
+      }
+
+      // Clear the tmux marker so the tab reverts to a regular shell tab.
+      // The tab stays open -- App.tsx will spawn a fresh PTY session into it.
+      setState(
+        produce((s) => {
+          const t = s.tabs.find((t) => t.id === tab.id);
+          if (t) {
+            t.tmuxSessionName = null;
+            t.tmuxWindowId = null;
+          }
+        }),
+      );
+    }
+  }
+
+  // --- tmux layout tree conversion ---
+
+  // Map of tmux session_id -> Rain pane ID for reuse across layout rebuilds
+  const tmuxSessionToPaneId = new Map<string, string>();
+
+  function getOrCreatePaneForSession(sessionId: string, tmuxPaneId: number): string {
+    const existing = tmuxSessionToPaneId.get(sessionId);
+    if (existing && stores.has(existing)) return existing;
+
+    const rainPaneId = `pane-${++paneCounter}`;
+    const store = createTerminalStore();
+    store.setState({ sessionId, connected: true, tmuxPaneId });
+    stores.set(rainPaneId, store);
+    sessionToTab.set(sessionId, rainPaneId);
+    tmuxSessionToPaneId.set(sessionId, rainPaneId);
+    return rainPaneId;
+  }
+
+  // Convert a TmuxLayoutTree into Rain's binary PaneNode tree.
+  // tmux splits can have N children, Rain's PaneSplit is binary (first/second).
+  // We fold N children into nested binary splits with proportional ratios.
+  function tmuxTreeToPaneNode(tree: TmuxLayoutTree): PaneNode {
+    if (tree.type === "Leaf") {
+      const rainPaneId = getOrCreatePaneForSession(tree.session_id, tree.pane_id);
+      return {
+        type: "leaf",
+        id: rainPaneId,
+        sessionId: tree.session_id,
+      } as PaneLeaf;
+    }
+
+    const direction: "horizontal" | "vertical" =
+      tree.type === "HSplit" ? "horizontal" : "vertical";
+    const children = tree.children.map((c) => tmuxTreeToPaneNode(c));
+
+    if (children.length === 0) {
+      // shouldn't happen but be safe
+      return children[0] ?? { type: "leaf", id: `pane-${++paneCounter}`, sessionId: "" } as PaneLeaf;
+    }
+    if (children.length === 1) return children[0];
+
+    // Binary fold: pair up children left to right.
+    // Compute ratio from the child sizes.
+    return binaryFoldChildren(children, tree.children, direction);
+  }
+
+  function binaryFoldChildren(
+    nodes: PaneNode[],
+    originals: TmuxLayoutTree[],
+    direction: "horizontal" | "vertical",
+  ): PaneNode {
+    if (nodes.length === 1) return nodes[0];
+    if (nodes.length === 2) {
+      const sizeA = childSize(originals[0], direction);
+      const sizeB = childSize(originals[1], direction);
+      const total = sizeA + sizeB;
+      return {
+        type: "split",
+        id: `split-${++paneCounter}`,
+        direction,
+        ratio: total > 0 ? sizeA / total : 0.5,
+        first: nodes[0],
+        second: nodes[1],
+      } as PaneSplit;
+    }
+
+    // More than 2: fold first child against the rest
+    const sizeFirst = childSize(originals[0], direction);
+    const sizeRest = originals.slice(1).reduce((s, c) => s + childSize(c, direction), 0);
+    const total = sizeFirst + sizeRest;
+
+    return {
+      type: "split",
+      id: `split-${++paneCounter}`,
+      direction,
+      ratio: total > 0 ? sizeFirst / total : 0.5,
+      first: nodes[0],
+      second: binaryFoldChildren(nodes.slice(1), originals.slice(1), direction),
+    } as PaneSplit;
+  }
+
+  function childSize(tree: TmuxLayoutTree, direction: "horizontal" | "vertical"): number {
+    if (direction === "horizontal") return tree.width;
+    return tree.height;
+  }
+
+  function rebuildTmuxLayout(windowId: number, layoutTree: TmuxLayoutTree) {
+    // Find the tmux tab for this window (or any tmux tab if windowId doesn't match)
+    const tmuxTab = state.tabs.find(
+      (t) => t.tmuxWindowId === windowId && t.tmuxSessionName != null,
+    ) ?? state.tabs.find((t) => t.tmuxSessionName != null);
+
+    if (!tmuxTab) return;
+
+    // Convert the layout tree into a PaneNode tree
+    const newPaneTree = tmuxTreeToPaneNode(layoutTree);
+
+    // Collect all pane IDs in the new tree to find which old ones to remove
+    const newLeafIds = new Set<string>();
+    collectLeafIdsFromNode(newPaneTree, newLeafIds);
+
+    // Clean up stores for panes that no longer exist in the new layout
+    if (tmuxTab.paneTree) {
+      for (const oldPaneId of collectLeafIds(tmuxTab.paneTree)) {
+        if (!newLeafIds.has(oldPaneId)) {
+          const store = stores.get(oldPaneId);
+          if (store?.state.sessionId) {
+            sessionToTab.delete(store.state.sessionId);
+            tmuxSessionToPaneId.delete(store.state.sessionId);
+          }
+          stores.delete(oldPaneId);
+        }
+      }
+    }
+
+    // Update the tab's pane tree (PaneContainer re-renders reactively)
+    setState(
+      produce((s) => {
+        const t = s.tabs.find((t) => t.id === tmuxTab.id);
+        if (t) {
+          t.paneTree = newPaneTree;
+          t.tmuxWindowId = windowId;
+          // If the active pane was removed, pick the first leaf
+          if (t.activePaneId && !newLeafIds.has(t.activePaneId)) {
+            t.activePaneId = firstLeafId(newPaneTree);
+          }
+        }
+      }),
+    );
+  }
+
+  function collectLeafIdsFromNode(node: PaneNode, ids: Set<string>) {
+    if (node.type === "leaf") {
+      ids.add(node.id);
+    } else {
+      collectLeafIdsFromNode(node.first, ids);
+      collectLeafIdsFromNode(node.second, ids);
+    }
+  }
+
+  function firstLeafId(node: PaneNode): string {
+    if (node.type === "leaf") return node.id;
+    return firstLeafId(node.first);
+  }
+
+  function replaceTabSession(tabId: string, newSessionId: string) {
+    const tab = state.tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+
+    const newPaneId = `pane-${++paneCounter}`;
+    const store = createTerminalStore();
+    store.setState({ sessionId: newSessionId, connected: true });
+    stores.set(newPaneId, store);
+    sessionToTab.set(newSessionId, newPaneId);
+
+    const paneTree: PaneLeaf = {
+      type: "leaf",
+      id: newPaneId,
+      sessionId: newSessionId,
+    };
+
+    setState(
+      produce((s) => {
+        const t = s.tabs.find((t) => t.id === tabId);
+        if (t) {
+          t.paneTree = paneTree;
+          t.activePaneId = newPaneId;
+          t.sessionId = newSessionId;
+        }
+      }),
+    );
+  }
+
+  function detachTab(tabId: string): { sessionId: string; label: string; cwd: string } | null {
+    const tabData = state.tabs.find((t) => t.id === tabId);
+    if (!tabData || tabData.type !== "terminal" || !tabData.sessionId) return null;
+
+    const result = {
+      sessionId: tabData.sessionId,
+      label: tabData.customLabel ?? tabData.label,
+      cwd: tabData.cwd,
+    };
+
+    const idx = state.tabs.findIndex((t) => t.id === tabId);
+
+    // Clean up stores and session mappings without destroying the PTY session
+    if (tabData.paneTree) {
+      for (const paneId of collectLeafIds(tabData.paneTree)) {
+        stores.delete(paneId);
+      }
+      for (const sid of collectSessionIds(tabData.paneTree)) {
+        sessionToTab.delete(sid);
+      }
+    }
+
+    setState(
+      produce((s) => {
+        s.tabs.splice(idx, 1);
+        if (s.activeIndex >= s.tabs.length) {
+          s.activeIndex = s.tabs.length - 1;
+        } else if (s.activeIndex > idx) {
+          s.activeIndex--;
+        }
+      }),
+    );
+
+    return result;
+  }
+
+  function popClosedTab(): { cwd: string; label: string; customLabel: string | null; tabColor: string | null } | null {
+    return closedTabsStack.pop() ?? null;
+  }
+
+  function updateTabColor(tabId: string, color: string | null) {
+    setState(
+      produce((s) => {
+        const tab = s.tabs.find((t) => t.id === tabId);
+        if (tab) tab.tabColor = color;
+      }),
+    );
+  }
+
   function moveTab(fromIndex: number, toIndex: number) {
     if (
       fromIndex === toIndex ||
@@ -407,10 +870,26 @@ export function createTabsStore(): TabsStore {
     );
   }
 
+  function getTabsExcept(tabId: string): string[] {
+    return state.tabs
+      .filter((t) => t.id !== tabId && t.type === "terminal")
+      .map((t) => t.id);
+  }
+
+  function getTabsToRight(tabId: string): string[] {
+    const idx = state.tabs.findIndex((t) => t.id === tabId);
+    if (idx < 0) return [];
+    return state.tabs
+      .slice(idx + 1)
+      .filter((t) => t.type === "terminal")
+      .map((t) => t.id);
+  }
+
   return {
     state,
     stores,
     addTab,
+    addTabFromManifest,
     addSettingsTab,
     closeTab,
     switchTab,
@@ -429,5 +908,14 @@ export function createTabsStore(): TabsStore {
     getActivePaneId,
     getPaneTree,
     moveTab,
+    addTmuxPane,
+    removeTmuxTabs,
+    rebuildTmuxLayout,
+    replaceTabSession,
+    detachTab,
+    updateTabColor,
+    popClosedTab,
+    getTabsExcept,
+    getTabsToRight,
   };
 }

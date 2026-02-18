@@ -42,6 +42,16 @@ __rain_suppress_prompt() {
 }
 __rain_suppress_prompt
 
+# Intercept tmux so Rain can handle it via control mode.
+# Users can bypass with `command tmux`, RAIN_TMUX_MODE=native, or RAIN_NATIVE_TMUX=1.
+tmux() {
+    if [[ "$RAIN_TMUX_MODE" == "native" || -n "$RAIN_NATIVE_TMUX" ]]; then
+        command tmux "$@"
+        return
+    fi
+    printf '\033]133;T;%s\007' "$*"
+}
+
 # Register hooks (append, don't replace existing hooks).
 # Prompt suppression runs first (prepend), then our OSC hooks.
 precmd_functions=(__rain_suppress_prompt "${precmd_functions[@]}")

@@ -4,6 +4,7 @@ pub mod session;
 pub use session::Session;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -33,9 +34,21 @@ impl PtyManager {
         cwd: Option<&str>,
         rows: u16,
         cols: u16,
+        env: Option<&HashMap<String, String>>,
+        tmux_mode: Option<&str>,
     ) -> Result<SpawnResult, Box<dyn std::error::Error + Send + Sync>> {
         let pty_system = native_pty_system();
-        let shell = shell_path.map(String::from).unwrap_or_else(detect_shell);
+        let shell = match shell_path {
+            Some(p) if std::path::Path::new(p).exists() => p.to_string(),
+            Some(p) => {
+                tracing::warn!(
+                    "Configured shell '{}' not found; falling back to default",
+                    p
+                );
+                detect_shell()
+            }
+            None => detect_shell(),
+        };
 
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -55,12 +68,39 @@ impl PtyManager {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("RAIN_TERMINAL", "1");
-        cmd.env("LANG", "en_US.UTF-8");
+        cmd.env("TERM_PROGRAM", "Rain");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+
+        // Inherit LANG from parent environment; fall back to en_US.UTF-8
+        let lang = std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string());
+        cmd.env("LANG", &lang);
+
+        // Inherit LC_ALL if set in the parent environment
+        if let Ok(lc_all) = std::env::var("LC_ALL") {
+            cmd.env("LC_ALL", &lc_all);
+        }
+
+        if let Some(custom_env) = env {
+            for (key, value) in custom_env {
+                let trimmed_key = key.trim();
+                if trimmed_key.is_empty() {
+                    continue;
+                }
+                cmd.env(trimmed_key, value);
+            }
+        }
+
+        let tmux_mode = match tmux_mode {
+            Some("native") => "native",
+            _ => "integrated",
+        };
+        cmd.env("RAIN_TMUX_MODE", tmux_mode);
 
         let shell_name = crate::shell::detect::shell_name(&shell);
+        let mut temp_dir: Option<PathBuf> = None;
         if let Some(init_cmd) = shell_init_command(shell_name) {
             cmd.env("RAIN_SHELL_INIT", &init_cmd);
-            apply_shell_init(&mut cmd, shell_name, &init_cmd)?;
+            temp_dir = apply_shell_init(&mut cmd, shell_name, &init_cmd)?;
         } else {
             // Default to login shell when no integration is available
             cmd.arg("--login");
@@ -70,17 +110,22 @@ impl PtyManager {
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
-        let session = Session::new(pair.master, child, writer, rows, cols);
+        let mut session = Session::new(pair.master, child, writer, rows, cols);
+        if let Some(dir) = temp_dir {
+            session.set_temp_dir(dir);
+        }
 
         Ok(SpawnResult { session, reader })
     }
 }
 
+/// Apply shell-specific init configuration. Returns the temp directory path
+/// if one was created (for zsh/bash), so the caller can clean it up later.
 fn apply_shell_init(
     cmd: &mut CommandBuilder,
     shell_name: &str,
     init_cmd: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
     match shell_name {
         "zsh" => {
             let dir = create_shell_init_dir("zsh")?;
@@ -111,8 +156,9 @@ fi
                     cmd.env("RAIN_ORIG_ZDOTDIR", orig);
                 }
             }
-            cmd.env("ZDOTDIR", dir);
+            cmd.env("ZDOTDIR", dir.clone());
             cmd.arg("--login");
+            Ok(Some(dir))
         }
         "bash" => {
             let dir = create_shell_init_dir("bash")?;
@@ -138,17 +184,18 @@ fi
             cmd.arg("--noprofile");
             cmd.arg("--rcfile");
             cmd.arg(rc_path);
+            Ok(Some(dir))
         }
         "fish" => {
             cmd.arg("-C");
             cmd.arg(init_cmd);
+            Ok(None)
         }
         _ => {
             cmd.arg("--login");
+            Ok(None)
         }
     }
-
-    Ok(())
 }
 
 fn create_shell_init_dir(shell_name: &str) -> Result<PathBuf, std::io::Error> {

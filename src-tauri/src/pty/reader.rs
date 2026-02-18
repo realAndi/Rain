@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
-use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use tauri::Emitter;
 use crate::render::RenderFrame;
 use crate::terminal::TerminalState;
 
-use super::session::SharedWriter;
+use super::session::{SharedChild, SharedExitCode, SharedWriter};
 
 /// Payload sent to the frontend for each render frame.
 #[derive(serde::Serialize, Clone)]
@@ -42,6 +42,8 @@ pub fn spawn_pty_threads(
     mut reader: Box<dyn Read + Send>,
     state: Arc<Mutex<TerminalState>>,
     writer: SharedWriter,
+    child: SharedChild,
+    exit_code: SharedExitCode,
     app_handle: AppHandle,
     session_id: String,
     running: Arc<AtomicBool>,
@@ -53,6 +55,8 @@ pub fn spawn_pty_threads(
     let (render_waker, render_rx) = sync_channel::<()>(1);
     let parser_state = Arc::clone(&state);
     let parser_writer = Arc::clone(&writer);
+    let parser_child = Arc::clone(&child);
+    let parser_exit_code = Arc::clone(&exit_code);
     let parser_session = session_id.clone();
     let parser_running = Arc::clone(&running);
     let parser_waker = render_waker.clone();
@@ -66,8 +70,22 @@ pub fn spawn_pty_threads(
             while parser_running.load(Ordering::Acquire) {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        // EOF: shell exited
+                        // EOF: shell exited -- capture exit code via try_wait
                         tracing::info!("PTY reader EOF for session {}", &parser_session[..8]);
+                        if let Ok(Some(status)) = parser_child.lock().try_wait() {
+                            let code = status.exit_code() as i32;
+                            *parser_exit_code.lock() = Some(code);
+                            tracing::info!(
+                                "Session {} exited with code {}",
+                                &parser_session[..8],
+                                code
+                            );
+                            tracing::debug!(
+                                "Session {} exit status: {:?}",
+                                &parser_session[..8],
+                                status
+                            );
+                        }
                         parser_running.store(false, Ordering::Release);
                         notify_render(&parser_waker);
                         break;
@@ -97,6 +115,15 @@ pub fn spawn_pty_threads(
                                 e
                             );
                         }
+                        // Capture exit code on error path (may have exited before read failed)
+                        if let Ok(Some(status)) = parser_child.lock().try_wait() {
+                            *parser_exit_code.lock() = Some(status.exit_code() as i32);
+                            tracing::debug!(
+                                "Session {} exited: {:?}",
+                                &parser_session[..8],
+                                status
+                            );
+                        }
                         parser_running.store(false, Ordering::Release);
                         notify_render(&parser_waker);
                         break;
@@ -107,6 +134,7 @@ pub fn spawn_pty_threads(
         .expect("Failed to spawn PTY parser thread");
 
     let render_state = Arc::clone(&state);
+    let render_exit_code = Arc::clone(&exit_code);
     let render_app = app_handle;
     let render_session = session_id;
     let render_running = Arc::clone(&running);
@@ -193,11 +221,12 @@ pub fn spawn_pty_threads(
                 let _ = render_app.emit("render-frame", &payload);
             }
 
+            let captured_exit_code = render_exit_code.lock().take();
             let _ = render_app.emit(
                 "session-ended",
                 &SessionEndPayload {
                     session_id: render_session,
-                    exit_code: None,
+                    exit_code: captured_exit_code,
                 },
             );
         })

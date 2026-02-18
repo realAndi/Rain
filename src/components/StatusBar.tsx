@@ -1,10 +1,19 @@
-import { Component, Show } from "solid-js";
+import { Component, Show, createSignal } from "solid-js";
 import type { TerminalStore } from "../stores/terminal";
 import { useConfig } from "../stores/config";
 import { IconFolder, IconConnection, IconTerminal } from "./icons";
 
 export const StatusBar: Component<{ store: TerminalStore | undefined }> = (props) => {
   const { config } = useConfig();
+  const [copied, setCopied] = createSignal(false);
+
+  const copyPath = () => {
+    const cwd = props.store?.state.cwd;
+    if (!cwd) return;
+    navigator.clipboard.writeText(cwd).catch(console.error);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
 
   const shortCwd = () => {
     const cwd = props.store?.state.cwd;
@@ -44,11 +53,22 @@ export const StatusBar: Component<{ store: TerminalStore | undefined }> = (props
   };
 
   return (
-    <div class="status-bar">
+    <div class="status-bar" role="status" aria-label="Terminal status">
       <Show when={config().statusBarShowPath}>
         <div class="status-item">
           <IconFolder size={11} />
-          <span>{shortCwd()}</span>
+          <span class="status-bar-path-clickable" onClick={copyPath} title="Click to copy full path">
+            {copied() ? "Copied!" : shortCwd()}
+          </span>
+        </div>
+      </Show>
+
+      <Show when={props.store?.state.tmuxPaneId != null || props.store?.state.tmuxActive === true}>
+        <div class="status-item status-tmux-badge">
+          <span>tmux</span>
+          <Show when={props.store?.state.tmuxPaneId != null}>
+            <span class="tmux-pane-id">%{props.store?.state.tmuxPaneId}</span>
+          </Show>
         </div>
       </Show>
 
