@@ -191,18 +191,25 @@ impl Session {
             // Step 3: Force kill if still alive
             if !exited {
                 if let Some(raw_pid) = pid {
-                    // Try to kill the entire process group first
                     #[cfg(unix)]
                     {
                         unsafe {
-                            // Kill process group (negative pid)
                             libc::kill(-(raw_pid as i32), libc::SIGKILL);
-                            // Also kill the process directly in case it changed groups
                             libc::kill(raw_pid as i32, libc::SIGKILL);
                         }
                     }
+
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x08000000;
+                        // /F = force, /T = kill child process tree
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/F", "/T", "/PID", &raw_pid.to_string()])
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .status();
+                    }
                 }
-                // Also try direct kill via wait (which reaps the process)
                 let _ = child.try_wait();
             }
         }

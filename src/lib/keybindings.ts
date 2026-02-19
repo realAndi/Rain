@@ -44,8 +44,16 @@ export const DEFAULT_KEYBINDINGS: KeybindingMap = {
 const KEYBINDING_STORAGE_KEY = "rain-keybindings";
 
 let _customBindings: Partial<KeybindingMap> = {};
+let _kbInitialized = false;
+
+function ensureKeybindingsLoaded(): void {
+  if (_kbInitialized) return;
+  _kbInitialized = true;
+  loadKeybindings();
+}
 
 export function loadKeybindings(): void {
+  _kbInitialized = true;
   try {
     const raw = localStorage.getItem(KEYBINDING_STORAGE_KEY);
     if (raw) {
@@ -66,10 +74,12 @@ export function saveKeybindings(bindings: Partial<KeybindingMap>): void {
 }
 
 export function getKeybinding(action: string): Keybinding {
+  ensureKeybindingsLoaded();
   return _customBindings[action] ?? DEFAULT_KEYBINDINGS[action] ?? { key: "" };
 }
 
 export function getAllKeybindings(): KeybindingMap {
+  ensureKeybindingsLoaded();
   return { ...DEFAULT_KEYBINDINGS, ..._customBindings };
 }
 
@@ -100,5 +110,3 @@ export function formatKeybinding(binding: Keybinding): string {
   return parts.join(isMac ? "" : "+");
 }
 
-// Initialize on load
-loadKeybindings();

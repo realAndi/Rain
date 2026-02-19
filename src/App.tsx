@@ -58,6 +58,7 @@ import {
   disableLiquidGlassEffect,
   setLiquidGlassEffectSafe,
 } from "./lib/liquidGlass";
+import { detectPlatform, shortenHomePath } from "./lib/platform";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
@@ -469,20 +470,20 @@ const App: Component = () => {
       return;
     }
 
-    // Cmd+= or Cmd++: zoom in
-    if (e.metaKey && (key === "=" || key === "+")) {
+    // Cmd+= or Cmd++ (Mac) / Ctrl+= or Ctrl++ (Win/Linux): zoom in
+    if ((isMac ? e.metaKey : e.ctrlKey) && (key === "=" || key === "+")) {
       e.preventDefault();
       updateConfig({ fontSize: Math.min(24, config().fontSize + 1) });
       return;
     }
-    // Cmd+-: zoom out
-    if (e.metaKey && key === "-") {
+    // Cmd+- (Mac) / Ctrl+- (Win/Linux): zoom out
+    if ((isMac ? e.metaKey : e.ctrlKey) && key === "-") {
       e.preventDefault();
       updateConfig({ fontSize: Math.max(10, config().fontSize - 1) });
       return;
     }
-    // Cmd+0: reset zoom
-    if (e.metaKey && key === "0") {
+    // Cmd+0 (Mac) / Ctrl+0 (Win/Linux): reset zoom
+    if ((isMac ? e.metaKey : e.ctrlKey) && key === "0") {
       e.preventDefault();
       updateConfig({ fontSize: defaultConfig.fontSize });
       return;
@@ -1479,7 +1480,7 @@ const App: Component = () => {
       if (activeCmd) {
         title = activeCmd;
       } else if (cwd) {
-        title = cwd.replace(/^\/Users\/[^/]+/, "~");
+        title = shortenHomePath(cwd);
       } else {
         title = "";
       }
@@ -1587,6 +1588,7 @@ const App: Component = () => {
   return (
     <div
       class={`rain-app${windowHighlighted() ? " rain-window-highlighted" : ""}`}
+      data-platform={detectPlatform()}
       style={rootStyle()}
     >
       <Show when={updateInfo()}>

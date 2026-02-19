@@ -35,3 +35,14 @@ export function modifierKey(): string {
 export function modifierSymbol(): string {
   return isMacOS() ? "\u2318" : "Ctrl+";
 }
+
+/**
+ * Shorten a working directory path by replacing the user's home directory
+ * prefix with `~`. Handles macOS, Linux, and Windows home directory formats.
+ */
+export function shortenHomePath(cwd: string): string {
+  return cwd
+    .replace(/^\/Users\/[^/]+/, "~")         // macOS: /Users/username
+    .replace(/^\/home\/[^/]+/, "~")           // Linux: /home/username
+    .replace(/^[A-Z]:\\Users\\[^\\]+/, "~");  // Windows: C:\Users\username
+}

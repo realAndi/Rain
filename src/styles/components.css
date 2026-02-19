@@ -369,6 +369,30 @@
   color: var(--fg);
 }
 
+/* ---- Platform-specific tab bar overrides ---- */
+
+/*
+ * Windows: caption buttons (min/max/close) are on the RIGHT side of the
+ * overlay title bar, roughly 138px wide (3 × 46px). Remove the left traffic-
+ * light spacer and add right padding so tab actions don't sit under the
+ * caption buttons.
+ */
+[data-platform="windows"] .tab-traffic-spacer {
+  width: 8px;
+}
+
+[data-platform="windows"] .tab-actions {
+  padding-right: 142px;
+}
+
+/*
+ * Linux: no native overlay traffic lights or caption buttons in most
+ * compositors. A small left indent keeps tabs from touching the window edge.
+ */
+[data-platform="linux"] .tab-traffic-spacer {
+  width: 8px;
+}
+
 /* ---- Scroll-to-bottom FAB ---- */
 
 .scroll-fab {

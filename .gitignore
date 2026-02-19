@@ -3,3 +3,7 @@ dist/
 src-tauri/target/
 *.log
 .DS_Store
+
+# AI agent artifacts
+.claude/
+sub-agent-docs/

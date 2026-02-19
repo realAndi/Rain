@@ -29,7 +29,7 @@ export async function getCurrentVersion(): Promise<string> {
   return _cachedVersion;
 }
 
-function compareVersions(current: string, latest: string): boolean {
+export function compareVersions(current: string, latest: string): boolean {
   const parse = (v: string) =>
     v
       .replace(/^v/, "")

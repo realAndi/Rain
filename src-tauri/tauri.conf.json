@@ -19,8 +19,17 @@
     ],
     "resources": [
       "icons/default-icon.png",
-      "icons/simple-icon.png"
-    ]
+      "icons/simple-icon.png",
+      "shell-hooks/*"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   },
   "app": {
     "windows": [

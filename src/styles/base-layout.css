@@ -111,3 +111,9 @@ body {
     background: var(--bg, #0e0e0e) !important;
   }
 }
+
+/* Windows: round corners to match Win11 chrome */
+.rain-app[data-platform="windows"] {
+  outline-width: 1px;
+  border-radius: 8px;
+}

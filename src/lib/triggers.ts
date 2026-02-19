@@ -12,14 +12,26 @@ const TRIGGERS_STORAGE_KEY = "rain-triggers";
 
 let _triggers: OutputTrigger[] = [];
 let _compiledPatterns: Map<string, RegExp> = new Map();
-const NOTIFY_THROTTLE_MS = 3_000;
-const NOTIFY_DEDUP_MS = 20_000;
+let _triggersInitialized = false;
+export const NOTIFY_THROTTLE_MS = 3_000;
+export const NOTIFY_DEDUP_MS = 20_000;
 const _lastNotifyByTrigger = new Map<
   string,
   { timestamp: number; sample: string }
 >();
 
+function ensureTriggersLoaded(): void {
+  if (_triggersInitialized) return;
+  _triggersInitialized = true;
+  loadTriggers();
+}
+
+export function resetNotificationThrottles(): void {
+  _lastNotifyByTrigger.clear();
+}
+
 export function loadTriggers(): OutputTrigger[] {
+  _triggersInitialized = true;
   try {
     const raw = localStorage.getItem(TRIGGERS_STORAGE_KEY);
     if (raw) {
@@ -77,6 +89,7 @@ function recompilePatterns() {
 }
 
 export function saveTriggers(triggers: OutputTrigger[]): void {
+  _triggersInitialized = true;
   _triggers = triggers;
   recompilePatterns();
   try {
@@ -87,6 +100,7 @@ export function saveTriggers(triggers: OutputTrigger[]): void {
 }
 
 export function getTriggers(): OutputTrigger[] {
+  ensureTriggersLoaded();
   if (_triggers.length === 0) return loadTriggers();
   return _triggers;
 }
@@ -110,6 +124,7 @@ export function deleteTrigger(id: string): void {
 }
 
 export function checkOutput(text: string): OutputTrigger | null {
+  ensureTriggersLoaded();
   for (const [id, regex] of _compiledPatterns) {
     if (regex.test(text)) {
       return _triggers.find((t) => t.id === id) ?? null;
@@ -163,7 +178,7 @@ export function executeTriggerAction(trigger: OutputTrigger, matchedText: string
   }
 }
 
-function shouldSkipNotification(trigger: OutputTrigger, matchedText: string): boolean {
+export function shouldSkipNotification(trigger: OutputTrigger, matchedText: string): boolean {
   const now = Date.now();
   const sample = matchedText.trim().replace(/\s+/g, " ").slice(0, 140).toLowerCase();
   const last = _lastNotifyByTrigger.get(trigger.id);
@@ -180,5 +195,3 @@ function shouldSkipNotification(trigger: OutputTrigger, matchedText: string): bo
   return false;
 }
 
-// Initialize
-loadTriggers();

@@ -455,4 +455,163 @@ mod tests {
             other => panic!("expected Exit, got {:?}", other),
         }
     }
+
+    #[test]
+    fn parse_layout_horizontal_split() {
+        // Two panes side by side: {left,right}
+        let layout = "ab12,160x48,0,0{80x48,0,0,0,80x48,80,0,1}";
+        let node = parse_layout(layout).expect("should parse hsplit");
+        match node {
+            LayoutNode::HSplit { width, height, children } => {
+                assert_eq!(width, 160);
+                assert_eq!(height, 48);
+                assert_eq!(children.len(), 2);
+                match &children[0] {
+                    LayoutNode::Leaf(geo) => {
+                        assert_eq!(geo.width, 80);
+                        assert_eq!(geo.pane_id, Some(0));
+                    }
+                    _ => panic!("expected first child to be Leaf"),
+                }
+                match &children[1] {
+                    LayoutNode::Leaf(geo) => {
+                        assert_eq!(geo.width, 80);
+                        assert_eq!(geo.pane_id, Some(1));
+                    }
+                    _ => panic!("expected second child to be Leaf"),
+                }
+            }
+            _ => panic!("expected HSplit"),
+        }
+    }
+
+    #[test]
+    fn parse_layout_vertical_split() {
+        // Two panes stacked: [top,bottom]
+        let layout = "ab12,80x48,0,0[80x24,0,0,0,80x24,0,24,1]";
+        let node = parse_layout(layout).expect("should parse vsplit");
+        match node {
+            LayoutNode::VSplit { width, height, children } => {
+                assert_eq!(width, 80);
+                assert_eq!(height, 48);
+                assert_eq!(children.len(), 2);
+                match &children[0] {
+                    LayoutNode::Leaf(geo) => {
+                        assert_eq!(geo.height, 24);
+                        assert_eq!(geo.pane_id, Some(0));
+                    }
+                    _ => panic!("expected top child to be Leaf"),
+                }
+                match &children[1] {
+                    LayoutNode::Leaf(geo) => {
+                        assert_eq!(geo.height, 24);
+                        assert_eq!(geo.y, 24);
+                        assert_eq!(geo.pane_id, Some(1));
+                    }
+                    _ => panic!("expected bottom child to be Leaf"),
+                }
+            }
+            _ => panic!("expected VSplit"),
+        }
+    }
+
+    #[test]
+    fn parse_layout_nested_split() {
+        // Left pane + right column split vertically
+        let layout = "ab12,160x48,0,0{80x48,0,0,0,80x48,80,0[80x24,80,0,1,80x24,80,24,2]}";
+        let node = parse_layout(layout).expect("should parse nested");
+        match node {
+            LayoutNode::HSplit { children, .. } => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(children[0], LayoutNode::Leaf(_)));
+                match &children[1] {
+                    LayoutNode::VSplit { children: inner, .. } => {
+                        assert_eq!(inner.len(), 2);
+                    }
+                    _ => panic!("expected nested VSplit"),
+                }
+            }
+            _ => panic!("expected HSplit at root"),
+        }
+    }
+
+    #[test]
+    fn collect_leaf_panes_from_nested_layout() {
+        let layout = "ab12,160x48,0,0{80x48,0,0,0,80x48,80,0[80x24,80,0,1,80x24,80,24,2]}";
+        let node = parse_layout(layout).expect("should parse");
+        let leaves = collect_leaf_panes(&node);
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(leaves[0].pane_id, Some(0));
+        assert_eq!(leaves[1].pane_id, Some(1));
+        assert_eq!(leaves[2].pane_id, Some(2));
+    }
+
+    #[test]
+    fn parse_layout_change_notification() {
+        let line = "%layout-change @1 ab12,80x24,0,0,0";
+        match parse_notification(line) {
+            TmuxNotification::LayoutChange { window_id, layout } => {
+                assert_eq!(window_id, 1);
+                assert_eq!(layout, "ab12,80x24,0,0,0");
+            }
+            other => panic!("expected LayoutChange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_window_renamed_notification() {
+        let line = "%window-renamed @3 my-project";
+        match parse_notification(line) {
+            TmuxNotification::WindowRenamed { window_id, name } => {
+                assert_eq!(window_id, 3);
+                assert_eq!(name, "my-project");
+            }
+            other => panic!("expected WindowRenamed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_session_changed_notification() {
+        let line = "%session-changed $2 dev";
+        match parse_notification(line) {
+            TmuxNotification::SessionChanged { session_id, name } => {
+                assert_eq!(session_id, 2);
+                assert_eq!(name, "dev");
+            }
+            other => panic!("expected SessionChanged, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_begin_end_notifications() {
+        let begin = "%begin 1234567890 42 0";
+        match parse_notification(begin) {
+            TmuxNotification::Begin { number } => assert_eq!(number, 42),
+            other => panic!("expected Begin, got {:?}", other),
+        }
+
+        let end = "%end 1234567890 42 0";
+        match parse_notification(end) {
+            TmuxNotification::End { number } => assert_eq!(number, 42),
+            other => panic!("expected End, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_line() {
+        let line = "some random output";
+        match parse_notification(line) {
+            TmuxNotification::Unknown(s) => assert_eq!(s, "some random output"),
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_window_close_notification() {
+        let line = "%window-close @5";
+        match parse_notification(line) {
+            TmuxNotification::WindowClose { window_id } => assert_eq!(window_id, 5),
+            other => panic!("expected WindowClose, got {:?}", other),
+        }
+    }
 }

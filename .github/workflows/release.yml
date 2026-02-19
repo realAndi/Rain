@@ -66,10 +66,163 @@ jobs:
 
             ### Installation
 
-            **Apple Silicon (M-series Macs):** Download `Rain_*_aarch64.dmg`
-            **Intel Macs:** Download `Rain_*_x64.dmg`
+            **macOS**
+            - Apple Silicon (M-series): Download `Rain_*_aarch64.dmg`
+            - Intel: Download `Rain_*_x64.dmg`
 
-            > **Note:** These builds are unsigned. On first launch, right-click the app and choose **Open** to bypass Gatekeeper.
+            **Windows**
+            - Download `Rain_*_x64-setup.exe` (NSIS installer)
+
+            **Linux**
+            - Debian/Ubuntu: Download `rain_*_amd64.deb`
+            - AppImage: Download `Rain_*_amd64.AppImage`
+
+            > **Note:** macOS builds are unsigned. On first launch, right-click the app and choose **Open** to bypass Gatekeeper.
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }} --bundles dmg,app
+
+  build-windows:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            label: x64
+
+    runs-on: ${{ matrix.runner }}
+    name: Windows (${{ matrix.label }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Windows code signing (optional — set these secrets to enable Authenticode signing)
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Rain ${{ github.ref_name }}"
+          releaseBody: |
+            ## Rain ${{ github.ref_name }}
+
+            ### Installation
+
+            **macOS**
+            - Apple Silicon (M-series): Download `Rain_*_aarch64.dmg`
+            - Intel: Download `Rain_*_x64.dmg`
+
+            **Windows**
+            - Download `Rain_*_x64-setup.exe` (NSIS installer)
+
+            **Linux**
+            - Debian/Ubuntu: Download `rain_*_amd64.deb`
+            - AppImage: Download `Rain_*_amd64.AppImage`
+
+            > **Note:** macOS builds are unsigned. On first launch, right-click the app and choose **Open** to bypass Gatekeeper.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }} --bundles nsis
+
+  build-linux:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            label: x64
+
+    runs-on: ${{ matrix.runner }}
+    name: Linux (${{ matrix.label }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Rain ${{ github.ref_name }}"
+          releaseBody: |
+            ## Rain ${{ github.ref_name }}
+
+            ### Installation
+
+            **macOS**
+            - Apple Silicon (M-series): Download `Rain_*_aarch64.dmg`
+            - Intel: Download `Rain_*_x64.dmg`
+
+            **Windows**
+            - Download `Rain_*_x64-setup.exe` (NSIS installer)
+
+            **Linux**
+            - Debian/Ubuntu: Download `rain_*_amd64.deb`
+            - AppImage: Download `Rain_*_amd64.AppImage`
+
+            > **Note:** macOS builds are unsigned. On first launch, right-click the app and choose **Open** to bypass Gatekeeper.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }} --bundles deb,appimage

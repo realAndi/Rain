@@ -35,7 +35,43 @@ pub fn set_window_blur_radius(webview: WebviewWindow, radius: u32) -> Result<(),
         tracing::info!("Window blur radius set to {}px", radius);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "dwmapi")]
+        extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: isize,
+                attr: u32,
+                value: *const std::ffi::c_void,
+                size: u32,
+            ) -> i32;
+        }
+
+        let hwnd = webview
+            .hwnd()
+            .map_err(|e| format!("Failed to get HWND: {}", e))?
+            .0 as isize;
+
+        // DWM has no variable blur radius; map to backdrop type:
+        // radius 0 → disabled, radius > 0 → Acrylic (system blur)
+        let backdrop_type: i32 = if radius > 0 { 3 } else { 1 };
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                38, // DWMWA_SYSTEMBACKDROP_TYPE (1=Disable, 2=Mica, 3=Acrylic)
+                &backdrop_type as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+
+        tracing::info!(
+            "Window backdrop set to {} (requested radius {}px)",
+            if radius > 0 { "Acrylic" } else { "disabled" },
+            radius
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (webview, radius);
     }
@@ -68,7 +104,35 @@ pub fn set_window_opacity(webview: WebviewWindow, opacity: f64) -> Result<(), St
         tracing::info!("Window opacity set to {:.0}%", alpha * 100.0);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetWindowLongW(hwnd: isize, index: i32) -> i32;
+            fn SetWindowLongW(hwnd: isize, index: i32, value: i32) -> i32;
+            fn SetLayeredWindowAttributes(hwnd: isize, key: u32, alpha: u8, flags: u32) -> i32;
+        }
+
+        let alpha = opacity.clamp(0.0, 1.0);
+        let hwnd = webview
+            .hwnd()
+            .map_err(|e| format!("Failed to get HWND: {}", e))?
+            .0 as isize;
+
+        unsafe {
+            const GWL_EXSTYLE: i32 = -20;
+            const WS_EX_LAYERED: i32 = 0x0008_0000;
+            const LWA_ALPHA: u32 = 0x0000_0002;
+
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED);
+            SetLayeredWindowAttributes(hwnd, 0, (alpha * 255.0) as u8, LWA_ALPHA);
+        }
+
+        tracing::info!("Window opacity set to {:.0}%", alpha * 100.0);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (webview, opacity);
     }
@@ -76,26 +140,28 @@ pub fn set_window_opacity(webview: WebviewWindow, opacity: f64) -> Result<(), St
     Ok(())
 }
 
-/// Set the macOS dock icon at runtime from a bundled resource.
+/// Set the app icon at runtime from a bundled resource.
+/// On macOS this changes the dock icon via NSApplication; on other platforms
+/// it updates every window's icon using Tauri's cross-platform API.
 #[tauri::command]
 pub fn set_app_icon(app: AppHandle, icon_name: String) -> Result<(), String> {
+    let filename = match icon_name.as_str() {
+        "default" => "icons/default-icon.png",
+        "simple" => "icons/simple-icon.png",
+        _ => return Err(format!("Unknown icon: {}", icon_name)),
+    };
+
+    let resource_path = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Resource dir error: {}", e))?
+        .join(filename);
+
     #[cfg(target_os = "macos")]
     {
         use objc2::AnyThread;
         use objc2_app_kit::{NSApplication, NSImage};
         use objc2_foundation::{MainThreadMarker, NSString};
-
-        let filename = match icon_name.as_str() {
-            "default" => "icons/default-icon.png",
-            "simple" => "icons/simple-icon.png",
-            _ => return Err(format!("Unknown icon: {}", icon_name)),
-        };
-
-        let resource_path = app
-            .path()
-            .resource_dir()
-            .map_err(|e| format!("Resource dir error: {}", e))?
-            .join(filename);
 
         unsafe {
             let mtm = MainThreadMarker::new_unchecked();
@@ -103,15 +169,21 @@ pub fn set_app_icon(app: AppHandle, icon_name: String) -> Result<(), String> {
             let image = NSImage::initByReferencingFile(NSImage::alloc(), &ns_path);
             NSApplication::sharedApplication(mtm).setApplicationIconImage(image.as_deref());
         }
-
-        tracing::info!("App icon set to '{}'", icon_name);
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (app, icon_name);
+        let icon = tauri::image::Image::from_path(&resource_path)
+            .map_err(|e| format!("Failed to load icon '{}': {}", filename, e))?;
+
+        for (_label, window) in app.webview_windows() {
+            if let Err(e) = window.set_icon(icon.clone()) {
+                tracing::warn!("Failed to set icon on window: {}", e);
+            }
+        }
     }
 
+    tracing::info!("App icon set to '{}'", icon_name);
     Ok(())
 }
 
@@ -190,6 +262,12 @@ pub fn create_child_window(
 
     #[cfg(target_os = "macos")]
     crate::configure_macos_window(&child);
+
+    #[cfg(target_os = "windows")]
+    crate::configure_windows_window(&child);
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    crate::configure_linux_window(&child);
 
     tracing::info!(
         "Created child window '{}' for session {}",
@@ -316,7 +394,31 @@ html,body{{background:transparent;overflow:hidden;
         });
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetWindowLongW(hwnd: isize, index: i32) -> i32;
+            fn SetWindowLongW(hwnd: isize, index: i32, value: i32) -> i32;
+        }
+
+        if let Ok(hwnd) = ghost.hwnd() {
+            let hwnd = hwnd.0 as isize;
+            unsafe {
+                const GWL_EXSTYLE: i32 = -20;
+                const WS_EX_TRANSPARENT: i32 = 0x0000_0020;
+                const WS_EX_LAYERED: i32 = 0x0008_0000;
+                let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                SetWindowLongW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    ex_style | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+                );
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = ghost;
     }
@@ -387,4 +489,54 @@ pub fn register_global_hotkey(app: AppHandle, accelerator: String) -> Result<(),
 
     tracing::info!("Global hotkey registered: {}", normalized);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urlencoding_encode_preserves_unreserved_chars() {
+        assert_eq!(urlencoding_encode("hello"), "hello");
+        assert_eq!(urlencoding_encode("ABC-xyz_0.9~"), "ABC-xyz_0.9~");
+    }
+
+    #[test]
+    fn urlencoding_encode_encodes_spaces() {
+        assert_eq!(urlencoding_encode("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn urlencoding_encode_encodes_special_chars() {
+        assert_eq!(urlencoding_encode("a=b&c"), "a%3Db%26c");
+        assert_eq!(urlencoding_encode("100%"), "100%25");
+    }
+
+    #[test]
+    fn urlencoding_encode_handles_empty_string() {
+        assert_eq!(urlencoding_encode(""), "");
+    }
+
+    #[test]
+    fn urlencoding_encode_handles_unicode() {
+        let encoded = urlencoding_encode("café");
+        assert!(encoded.starts_with("caf"));
+        assert!(encoded.contains('%'));
+    }
+
+    #[test]
+    fn urlencoding_encode_handles_path_chars() {
+        assert_eq!(urlencoding_encode("/Users/test"), "%2FUsers%2Ftest");
+        assert_eq!(
+            urlencoding_encode("C:\\Users\\test"),
+            "C%3A%5CUsers%5Ctest"
+        );
+    }
+
+    #[test]
+    fn urlencoding_encode_roundtrip_with_query_params() {
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let encoded = urlencoding_encode(session_id);
+        assert_eq!(encoded, session_id, "UUIDs should pass through unchanged");
+    }
 }

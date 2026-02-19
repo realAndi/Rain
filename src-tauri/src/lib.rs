@@ -70,10 +70,68 @@ pub fn configure_macos_window(window: &tauri::WebviewWindow) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn configure_platform_window(_window: &tauri::WebviewWindow) {
-    // No-op on non-macOS platforms.
-    // Future: add Windows DWM blur or Linux compositor effects.
+/// Apply Windows-specific DWM configuration for dark title bar and transparent backdrop.
+#[cfg(target_os = "windows")]
+pub fn configure_windows_window(window: &tauri::WebviewWindow) {
+    #[repr(C)]
+    struct Margins {
+        left: i32,
+        right: i32,
+        top: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: isize,
+            attr: u32,
+            value: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+        fn DwmExtendFrameIntoClientArea(hwnd: isize, margins: *const Margins) -> i32;
+    }
+
+    let hwnd = match window.hwnd() {
+        Ok(h) => h.0 as isize,
+        Err(e) => {
+            tracing::warn!("Failed to get HWND: {}", e);
+            return;
+        }
+    };
+
+    unsafe {
+        let dark_mode: i32 = 1;
+        DwmSetWindowAttribute(
+            hwnd,
+            20, // DWMWA_USE_IMMERSIVE_DARK_MODE
+            &dark_mode as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+
+        // Extend frame into the entire client area so the DWM backdrop
+        // renders behind the transparent webview content.
+        let margins = Margins {
+            left: -1,
+            right: -1,
+            top: -1,
+            bottom: -1,
+        };
+        DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+}
+
+/// Apply Linux-specific window configuration.
+/// Transparency on Linux relies on the desktop compositor (Wayland compositors
+/// or X11 with picom/compton). Tauri's `transparent: true` config flag sets
+/// the GDK window visual to RGBA. CSS `backdrop-filter` provides the blur
+/// effect on composited desktops; the fallback in base-layout.css renders a
+/// solid background when the compositor doesn't support it.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn configure_linux_window(_window: &tauri::WebviewWindow) {
+    tracing::info!(
+        "Linux window configured (transparency via compositor + tauri.conf.json)"
+    );
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -87,8 +145,12 @@ pub fn run() {
 
     tracing::info!("Starting Rain terminal");
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_liquid_glass::init())
+    let builder = tauri::Builder::default();
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_plugin_liquid_glass::init());
+
+    builder
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
@@ -141,6 +203,22 @@ pub fn run() {
                     configure_macos_window(&window);
                 } else {
                     tracing::warn!("Main window not found during setup; could not set transparent webview background");
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    configure_windows_window(&window);
+                } else {
+                    tracing::warn!("Main window not found during setup; could not configure DWM effects");
+                }
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    configure_linux_window(&window);
                 }
             }
 

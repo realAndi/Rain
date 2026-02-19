@@ -25,7 +25,7 @@ const DEFAULT_PROFILES: ShellProfile[] = [
 let _profiles: ShellProfile[] = [];
 let _activeProfileId = "default";
 
-function normalizeProfile(profile: ShellProfile): ShellProfile {
+export function normalizeProfile(profile: ShellProfile): ShellProfile {
   const env = profile.env
     ? Object.fromEntries(
         Object.entries(profile.env)
@@ -42,7 +42,7 @@ function normalizeProfile(profile: ShellProfile): ShellProfile {
   };
 }
 
-function ensureDefaultProfile(profiles: ShellProfile[]): ShellProfile[] {
+export function ensureDefaultProfile(profiles: ShellProfile[]): ShellProfile[] {
   if (profiles.some((profile) => profile.id === "default")) {
     return profiles.map(normalizeProfile);
   }
@@ -158,5 +158,3 @@ export function getActiveProfile(): ShellProfile {
   return getProfile(id) ?? getProfile("default") ?? DEFAULT_PROFILES[0];
 }
 
-// Initialize
-loadProfiles();

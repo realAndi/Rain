@@ -1,23 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
-// We test the version comparison logic directly since the module has
-// side effects (imports from ipc). Extract the comparison function for testing.
-function compareVersions(current: string, latest: string): boolean {
-  const parse = (v: string) =>
-    v
-      .replace(/^v/, "")
-      .split(".")
-      .map((n) => parseInt(n, 10) || 0);
-  const c = parse(current);
-  const l = parse(latest);
-  for (let i = 0; i < Math.max(c.length, l.length); i++) {
-    const cv = c[i] ?? 0;
-    const lv = l[i] ?? 0;
-    if (lv > cv) return true;
-    if (lv < cv) return false;
-  }
-  return false;
-}
+vi.mock("../ipc", () => ({
+  getAppVersion: vi.fn().mockResolvedValue("0.1.0"),
+}));
+
+import { compareVersions } from "../updater";
 
 describe("compareVersions", () => {
   it("detects newer major version", () => {

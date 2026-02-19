@@ -232,7 +232,13 @@ impl TmuxController {
     /// `args` is the raw argument string from the user's tmux command
     /// (e.g. "", "new-session", "attach -t main").
     pub fn start(app_handle: AppHandle, args: &str) -> Result<Self, String> {
-        let tmux_path = which_tmux().ok_or("tmux is not installed")?;
+        let tmux_path = which_tmux().ok_or_else(|| {
+            if cfg!(windows) {
+                "tmux is not available on this system. Install tmux via MSYS2, Git Bash, or Scoop.".to_string()
+            } else {
+                "tmux is not installed".to_string()
+            }
+        })?;
 
         // tmux -CC needs a real PTY (tty), not piped stdio.
         let pty_system = native_pty_system();
@@ -897,37 +903,73 @@ fn create_pane_processor(
 
 /// Find the tmux binary on the system.
 fn which_tmux() -> Option<String> {
-    let common_paths = [
-        "/opt/homebrew/bin/tmux",
-        "/usr/local/bin/tmux",
-        "/usr/bin/tmux",
-    ];
+    #[cfg(unix)]
+    {
+        let common_paths = [
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/usr/bin/tmux",
+        ];
 
-    for path in &common_paths {
-        if std::path::Path::new(path).exists() {
-            return Some(path.to_string());
+        for path in &common_paths {
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
         }
+
+        std::process::Command::new("which")
+            .arg("tmux")
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    String::from_utf8(out.stdout)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                } else {
+                    None
+                }
+            })
     }
 
-    // Try PATH
-    std::process::Command::new("which")
-        .arg("tmux")
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                String::from_utf8(out.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
+    #[cfg(windows)]
+    {
+        // Look for a native tmux.exe (MSYS2, Git Bash, Cygwin, scoop, etc.)
+        if let Some(path) = std::process::Command::new("where.exe")
+            .arg("tmux")
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    String::from_utf8(out.stdout)
+                        .ok()
+                        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                } else {
+                    None
+                }
+            })
+        {
+            return Some(path);
+        }
+
+        // tmux requires a Unix PTY layer; native Windows support is rare.
+        // WSL has tmux but bridging control-mode across the WSL/Win boundary
+        // is not yet supported.
+        tracing::debug!("tmux not found on Windows PATH");
+        None
+    }
 }
 
 /// List available tmux sessions.
 pub fn list_tmux_sessions() -> Result<Vec<TmuxSessionListing>, String> {
-    let tmux_path = which_tmux().ok_or("tmux is not installed")?;
+    let tmux_path = which_tmux().ok_or_else(|| {
+        if cfg!(windows) {
+            "tmux is not available on this system. Install tmux via MSYS2, Git Bash, or Scoop.".to_string()
+        } else {
+            "tmux is not installed".to_string()
+        }
+    })?;
 
     let output = std::process::Command::new(&tmux_path)
         .args(["list-sessions", "-F", "#{session_id}:#{session_name}:#{session_windows}:#{session_attached}"])
@@ -1059,5 +1101,78 @@ mod tests {
             state.windows.get(&2).map(|w| w.name.as_str()),
             Some("build pane")
         );
+    }
+
+    #[test]
+    fn shell_split_simple_args() {
+        assert_eq!(shell_split("new-session"), vec!["new-session"]);
+        assert_eq!(
+            shell_split("attach -t main"),
+            vec!["attach", "-t", "main"]
+        );
+    }
+
+    #[test]
+    fn shell_split_double_quoted() {
+        assert_eq!(
+            shell_split(r#"new-session -s "my session""#),
+            vec!["new-session", "-s", "my session"]
+        );
+    }
+
+    #[test]
+    fn shell_split_single_quoted() {
+        assert_eq!(
+            shell_split("new-session -s 'my session'"),
+            vec!["new-session", "-s", "my session"]
+        );
+    }
+
+    #[test]
+    fn shell_split_escaped_space() {
+        assert_eq!(
+            shell_split(r"new-session -s my\ session"),
+            vec!["new-session", "-s", "my session"]
+        );
+    }
+
+    #[test]
+    fn shell_split_empty_string() {
+        let result: Vec<String> = shell_split("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn shell_split_only_whitespace() {
+        let result: Vec<String> = shell_split("   \t  ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn shell_split_mixed_quotes() {
+        assert_eq!(
+            shell_split(r#"send-keys -t %0 "hello 'world'""#),
+            vec!["send-keys", "-t", "%0", "hello 'world'"]
+        );
+    }
+
+    #[test]
+    fn shell_split_backslash_in_double_quotes() {
+        assert_eq!(
+            shell_split(r#""path\\to\\file""#),
+            vec![r"path\to\file"]
+        );
+    }
+
+    #[test]
+    fn parse_window_listing_line_rejects_empty() {
+        assert!(parse_window_listing_line("").is_none());
+        assert!(parse_window_listing_line("   ").is_none());
+    }
+
+    #[test]
+    fn parse_window_listing_line_rejects_missing_layout() {
+        assert!(parse_window_listing_line("@1").is_none());
+        assert!(parse_window_listing_line("@1 main").is_none());
     }
 }

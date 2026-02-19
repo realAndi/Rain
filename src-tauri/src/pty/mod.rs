@@ -102,7 +102,8 @@ impl PtyManager {
             cmd.env("RAIN_SHELL_INIT", &init_cmd);
             temp_dir = apply_shell_init(&mut cmd, shell_name, &init_cmd)?;
         } else {
-            // Default to login shell when no integration is available
+            // Login shell flag is Unix-specific; Windows shells don't support it
+            #[cfg(unix)]
             cmd.arg("--login");
         }
 
@@ -191,7 +192,21 @@ fi
             cmd.arg(init_cmd);
             Ok(None)
         }
+        "pwsh" | "powershell" => {
+            // PowerShell loads the user profile automatically (unless -NoProfile).
+            // -NoExit keeps the session interactive after sourcing our hooks.
+            cmd.arg("-NoExit");
+            cmd.arg("-Command");
+            cmd.arg(init_cmd);
+            Ok(None)
+        }
+        "cmd" => {
+            // cmd.exe has no hook integration; just start it normally.
+            // /D disables AutoRun registry commands for a clean start.
+            Ok(None)
+        }
         _ => {
+            #[cfg(unix)]
             cmd.arg("--login");
             Ok(None)
         }
