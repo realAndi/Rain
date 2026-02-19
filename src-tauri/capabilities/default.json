@@ -19,7 +19,7 @@
     "core:window:allow-set-size",
     "core:window:allow-set-focus",
     "core:window:allow-show",
-    "core:window:allow-hide",
-    "liquid-glass:default"
-  ]
+    "core:window:allow-hide"
+  ],
+  "platforms": ["linux", "windows", "macOS"]
 }

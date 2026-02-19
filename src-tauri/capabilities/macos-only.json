@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/macOS-schema.json",
+  "identifier": "macos-only",
+  "description": "macOS-specific permissions (Liquid Glass)",
+  "windows": ["main", "rain-*", "ghost-*"],
+  "permissions": [
+    "liquid-glass:default"
+  ],
+  "platforms": ["macOS"]
+}
