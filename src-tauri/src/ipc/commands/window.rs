@@ -173,8 +173,10 @@ pub fn set_app_icon(app: AppHandle, icon_name: String) -> Result<(), String> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let icon = tauri::image::Image::from_path(&resource_path)
-            .map_err(|e| format!("Failed to load icon '{}': {}", filename, e))?;
+        let png_data = std::fs::read(&resource_path)
+            .map_err(|e| format!("Failed to read icon '{}': {}", filename, e))?;
+        let icon = tauri::image::Image::from_bytes(&png_data)
+            .map_err(|e| format!("Failed to decode icon '{}': {}", filename, e))?;
 
         for (_label, window) in app.webview_windows() {
             if let Err(e) = window.set_icon(icon.clone()) {
@@ -248,15 +250,21 @@ pub fn create_child_window(
 
     let url = tauri::WebviewUrl::App(format!("index.html{}", url_params).into());
 
-    let child = tauri::WebviewWindowBuilder::new(&app, &window_label, url)
+    let mut builder = tauri::WebviewWindowBuilder::new(&app, &window_label, url)
         .title("")
         .inner_size(width, height)
         .position(x, y)
         .resizable(true)
         .decorations(true)
         .transparent(true)
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .min_inner_size(400.0, 300.0)
+        .min_inner_size(400.0, 300.0);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.title_bar_style(tauri::TitleBarStyle::Overlay);
+    }
+
+    let child = builder
         .build()
         .map_err(|e| format!("Failed to create child window: {}", e))?;
 
