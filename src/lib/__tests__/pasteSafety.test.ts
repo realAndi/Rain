@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { checkPasteContent } from "../pasteSafety";
 
+const fake = (prefix: string, body: string) => `${prefix}${body}`;
+
 describe("checkPasteContent", () => {
   it("allows short pastes", () => {
     expect(checkPasteContent("hello")).toEqual({ isSuspicious: false, reason: null });
@@ -15,20 +17,22 @@ describe("checkPasteContent", () => {
   });
 
   it("detects AWS access keys", () => {
-    const result = checkPasteContent("export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE");
+    const result = checkPasteContent(
+      `export AWS_ACCESS_KEY_ID=${fake("AKIA", "IOSFODNN7EXAMPLE")}`
+    );
     expect(result.isSuspicious).toBe(true);
   });
 
   it("detects GitHub tokens (ghp_)", () => {
     const result = checkPasteContent(
-      "git clone https://ghp_ABCDEFghijklmnopqrstuvwxyz0123456789@github.com/repo.git"
+      `git clone https://${fake("ghp_", "ABCDEFghijklmnopqrstuvwxyz0123456789")}@github.com/repo.git`
     );
     expect(result.isSuspicious).toBe(true);
   });
 
   it("detects GitHub tokens (ghs_)", () => {
     const result = checkPasteContent(
-      "GITHUB_TOKEN=ghs_ABCDEFghijklmnopqrstuvwxyz0123456789"
+      `GITHUB_TOKEN=${fake("ghs_", "ABCDEFghijklmnopqrstuvwxyz0123456789")}`
     );
     expect(result.isSuspicious).toBe(true);
   });
@@ -47,13 +51,15 @@ describe("checkPasteContent", () => {
 
   it("detects npm tokens", () => {
     const result = checkPasteContent(
-      "//registry.npmjs.org/:_authToken=npm_ABCDEFghijklmnopqrstuvwxyz0123456789"
+      `//registry.npmjs.org/:_authToken=${fake("npm_", "ABCDEFghijklmnopqrstuvwxyz0123456789")}`
     );
     expect(result.isSuspicious).toBe(true);
   });
 
   it("detects Slack tokens", () => {
-    const result = checkPasteContent("SLACK_TOKEN=xoxb-1234567890-abcdefghij");
+    const result = checkPasteContent(
+      `SLACK_TOKEN=${fake("xoxb-", "1234567890-abcdefghij")}`
+    );
     expect(result.isSuspicious).toBe(true);
   });
 
