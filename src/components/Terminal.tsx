@@ -12,7 +12,19 @@ import {
 } from "../lib/selection";
 import { useConfig } from "../stores/config";
 import { createInputBuffer } from "../stores/inputBuffer";
-import { writeInput, resizeTerminal, requestFullRedraw, tmuxSendKeys, tmuxResizePane, saveTextToFile } from "../lib/ipc";
+import {
+  SuggestionEngine,
+  HistoryProvider,
+  ContextualOutputProvider,
+  FilesystemProvider,
+  ProjectAwareProvider,
+  PathCommandProvider,
+  RuntimeSnoopProvider,
+  recordCommandInDir,
+  type FilesystemCache,
+  type SnoopCacheEntry,
+} from "../lib/suggestions";
+import { writeInput, resizeTerminal, requestFullRedraw, tmuxSendKeys, tmuxResizePane, saveTextToFile, listDirectory, scanProjectCommands, scanPathCommands, snoopPathContext, type ProjectCommands } from "../lib/ipc";
 import { checkPasteContent } from "../lib/pasteSafety";
 import { keyEventToBytes } from "../lib/input";
 import { measureFontMetrics, calculateTerminalSize, invalidateFontMetrics, type FontMetrics } from "../lib/font";
@@ -27,12 +39,144 @@ import { TraditionalBlock } from "./terminal/TraditionalBlock";
 import { WelcomeState } from "./terminal/WelcomeState";
 import { SearchBar } from "./terminal/SearchBar";
 
-export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpenSettings?: () => void; onSplitRight?: () => void; onSplitDown?: () => void }> = (props) => {
+export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabActive?: boolean; onOpenSettings?: () => void; onSplitRight?: () => void; onSplitDown?: () => void }> = (props) => {
   let containerRef!: HTMLDivElement;
   let scrollRef!: HTMLDivElement;
   let srAnnouncerRef: HTMLDivElement | undefined;
   const { config } = useConfig();
   const inputBuffer = createInputBuffer();
+
+  const suggestionEngine = new SuggestionEngine();
+  suggestionEngine.register(
+    new HistoryProvider(
+      () => inputBuffer.getHistory(),
+      () => props.store.state.snapshots,
+    ),
+  );
+  // Filesystem provider with async cache (option b from spec)
+  const [fsCache, setFsCache] = createSignal<FilesystemCache | null>(null);
+  let fsFetchDir = "";
+  let fsFetchCwd = "";
+  let fsFetchGeneration = 0;
+
+  suggestionEngine.register(
+    new ContextualOutputProvider(
+      () => props.store.state.snapshots,
+      () => fsCache(),
+    ),
+  );
+  suggestionEngine.register(
+    new FilesystemProvider(() => fsCache()),
+  );
+
+  function fetchDirectoryCache(dir: string, cwd: string) {
+    fsFetchDir = dir;
+    fsFetchCwd = cwd;
+    const gen = ++fsFetchGeneration;
+    listDirectory(dir)
+      .then((entries) => {
+        if (gen !== fsFetchGeneration) return;
+        setFsCache({ entries, dir, cwd });
+      })
+      .catch(() => {
+        if (gen !== fsFetchGeneration) return;
+        setFsCache(null);
+      });
+  }
+
+  createEffect(() => {
+    const text = inputBuffer.state().text;
+    const cwd = props.store.state.cwd;
+    const dir = FilesystemProvider.directoryToFetch(text, cwd);
+    if (!dir) {
+      if (fsCache()) setFsCache(null);
+      fsFetchDir = "";
+      fsFetchCwd = "";
+      return;
+    }
+    if (dir === fsFetchDir && cwd === fsFetchCwd) return;
+    fetchDirectoryCache(dir, cwd);
+  });
+
+  // Invalidate filesystem cache when a command completes (e.g. mkdir, touch, rm)
+  createEffect(on(
+    () => props.store.state.snapshots.length,
+    () => {
+      if (fsFetchDir && fsFetchCwd) {
+        fetchDirectoryCache(fsFetchDir, fsFetchCwd);
+      }
+    },
+  ));
+
+  // Project-aware provider: reads package.json scripts, Cargo.toml, Makefile targets, etc.
+  const [projectCommands, setProjectCommands] = createSignal<ProjectCommands | null>(null);
+  let projectCwd = "";
+
+  suggestionEngine.register(
+    new ProjectAwareProvider(() => projectCommands()),
+  );
+
+  createEffect(on(
+    () => props.store.state.cwd,
+    (cwd) => {
+      if (!cwd || cwd === projectCwd) return;
+      projectCwd = cwd;
+      scanProjectCommands(cwd)
+        .then((result) => {
+          if (cwd !== projectCwd) return;
+          setProjectCommands(result);
+        })
+        .catch(() => setProjectCommands(null));
+    },
+  ));
+
+  // PATH command provider: discovers installed CLI tools once on mount
+  const [pathCommands, setPathCommands] = createSignal<string[]>([]);
+
+  suggestionEngine.register(
+    new PathCommandProvider(() => pathCommands()),
+  );
+
+  // Runtime snoop provider: inspects target directories for runnable files and project config
+  const [snoopCache, setSnoopCache] = createSignal<SnoopCacheEntry | null>(null);
+  let snoopDir = "";
+  let snoopRuntime = "";
+  let snoopGeneration = 0;
+
+  suggestionEngine.register(
+    new RuntimeSnoopProvider(() => snoopCache()),
+  );
+
+  createEffect(() => {
+    const text = inputBuffer.state().text;
+    const cwd = props.store.state.cwd;
+    const parsed = RuntimeSnoopProvider.directoryToSnoop(text, cwd);
+    if (!parsed) {
+      if (snoopCache()) setSnoopCache(null);
+      snoopDir = "";
+      snoopRuntime = "";
+      return;
+    }
+    if (parsed.dir === snoopDir && parsed.runtime === snoopRuntime) return;
+    snoopDir = parsed.dir;
+    snoopRuntime = parsed.runtime;
+    const gen = ++snoopGeneration;
+    snoopPathContext(parsed.dir, parsed.runtime)
+      .then((result) => {
+        if (gen !== snoopGeneration) return;
+        setSnoopCache({
+          result,
+          dir: parsed.dir,
+          runtime: parsed.runtime,
+          cmdPrefix: parsed.cmdPrefix,
+          argDir: parsed.argDir,
+        });
+      })
+      .catch(() => {
+        if (gen !== snoopGeneration) return;
+        setSnoopCache(null);
+      });
+  });
 
   // Unified input sender: routes to tmux or PTY depending on pane type
   const sendInput = (sessionId: string, data: number[]) => {
@@ -73,6 +217,10 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     const cfg = config();
     const m = measureFontMetrics(cfg.fontFamily, cfg.fontSize, cfg.lineHeight, cfg.letterSpacing);
     setMetrics(m);
+
+    scanPathCommands()
+      .then((cmds) => setPathCommands(cmds))
+      .catch(() => {});
 
     containerRef.focus();
     const onWindowFocus = () => emitFocusEvent(true);
@@ -216,9 +364,10 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     setMetrics(m);
   });
 
-  // Keep terminal focused when active and not in alt screen
+  // Keep terminal focused when active and the tab is visible
   createEffect(() => {
-    if (props.active && !props.store.state.altScreen && containerRef) {
+    const tabActive = props.isTabActive ?? true;
+    if (tabActive && props.active && containerRef) {
       requestAnimationFrame(() => containerRef.focus());
     }
   });
@@ -1149,18 +1298,28 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
     }
 
     switch (e.key) {
-      case "Enter":
+      case "Enter": {
         e.preventDefault();
         const text = inputBuffer.submit();
+        if (text.trim()) {
+          recordCommandInDir(text, props.store.state.cwd);
+        }
         if (isClearCommand(text)) {
           props.store.clearHistory();
         }
         sendToPty(text);
         return;
+      }
 
       case "Tab":
         e.preventDefault();
-        sendTab();
+        if (e.shiftKey) {
+          inputBuffer.cycleSuggestion(-1);
+        } else if (inputBuffer.acceptSuggestion()) {
+          refreshSuggestionsNow();
+        } else {
+          sendTab();
+        }
         return;
 
       case "ArrowUp":
@@ -1186,9 +1345,24 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
 
       case "ArrowRight":
         e.preventDefault();
+        // Ctrl+Right: accept one word of the suggestion (Fish-style partial accept)
+        if (e.ctrlKey && !e.metaKey && !e.shiftKey) {
+          if (inputBuffer.acceptSuggestionWord()) return;
+        }
+        if (!e.metaKey && !e.altKey && !e.shiftKey && !e.ctrlKey) {
+          const s = inputBuffer.state();
+          if (s.cursorPos >= s.text.length && inputBuffer.acceptSuggestion()) {
+            return;
+          }
+        }
         if (e.metaKey) {
           inputBuffer.moveToEnd(e.shiftKey);
         } else if (e.altKey) {
+          // Alt+Right at end of input: partial accept; otherwise normal word move
+          if (!e.shiftKey) {
+            const s = inputBuffer.state();
+            if (s.cursorPos >= s.text.length && inputBuffer.acceptSuggestionWord()) return;
+          }
           inputBuffer.moveWordRight(e.shiftKey);
         } else {
           inputBuffer.moveCursorRight(e.shiftKey);
@@ -1217,7 +1391,9 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
 
       case "Escape":
         e.preventDefault();
-        inputBuffer.clear();
+        if (!inputBuffer.dismissSuggestion()) {
+          inputBuffer.clear();
+        }
         return;
 
       default:
@@ -1347,6 +1523,57 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
       visible: true,
       shape: config().cursorShape as "block" | "underline" | "bar",
     };
+  });
+
+  // Debounce suggestion computation: wait 500ms of no typing before showing ghost text
+  let suggestionTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function refreshSuggestionsNow() {
+    if (suggestionTimer) clearTimeout(suggestionTimer);
+    const s = inputBuffer.state();
+    const cwd = props.store.state.cwd;
+    const prefix = s.text;
+    const cursorAtEnd = s.cursorPos === prefix.length;
+    if (!prefix.trim() || !cursorAtEnd) return;
+    const candidates = suggestionEngine.suggestAll({ prefix, cwd, cursorAtEnd });
+    const texts = candidates.map((c) => c.text);
+    const best = texts.length > 0 ? texts[0] : null;
+    inputBuffer.setSuggestion(best);
+    inputBuffer.setAllSuggestions(texts);
+    inputBuffer.setSuggestionIndex(0);
+  }
+
+  createEffect(() => {
+    const s = inputBuffer.state();
+    const cwd = props.store.state.cwd;
+
+    // Clear current suggestion immediately when input changes
+    inputBuffer.setSuggestion(null);
+    inputBuffer.setAllSuggestions([]);
+    inputBuffer.setSuggestionIndex(0);
+
+    if (suggestionTimer) clearTimeout(suggestionTimer);
+
+    const prefix = s.text;
+    const cursorAtEnd = s.cursorPos === prefix.length;
+    if (!prefix.trim() || !cursorAtEnd) return;
+
+    suggestionTimer = setTimeout(() => {
+      refreshSuggestionsNow();
+    }, 500);
+  });
+
+  onCleanup(() => {
+    if (suggestionTimer) clearTimeout(suggestionTimer);
+  });
+
+  // Ghost text reacts to the suggestion signal (supports cycling)
+  const ghostText = createMemo(() => {
+    const s = inputBuffer.suggestion();
+    const text = inputBuffer.state().text;
+    if (!s || !s.startsWith(text)) return null;
+    const ghost = s.slice(text.length);
+    return ghost || null;
   });
 
   // Selection highlight rects (may span multiple lines when wrapped)
@@ -1590,6 +1817,9 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
                       )}
                     </For>
                     {inputBuffer.state().text || "\u200B"}
+                    <Show when={ghostText()}>
+                      <span class="ghost-suggestion">{ghostText()}</span>
+                    </Show>
                     {(() => {
                       const _key = blinkKey();
                       return (
@@ -1730,10 +1960,15 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; onOpen
                     <div class="input-selection" style={rect} />
                   )}
                 </For>
-                {/* Wrapped buffer lines */}
+                {/* Wrapped buffer lines with ghost suggestion on last line */}
                 <For each={bufferLines()}>
-                  {(line) => (
-                    <div class="term-line">{line}</div>
+                  {(line, index) => (
+                    <div class="term-line">
+                      {line}
+                      <Show when={index() === bufferLines().length - 1 && ghostText()}>
+                        <span class="ghost-suggestion">{ghostText()}</span>
+                      </Show>
+                    </div>
                   )}
                 </For>
                 {/* Blinking cursor with blink reset on input */}

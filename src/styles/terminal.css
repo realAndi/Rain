@@ -141,6 +141,13 @@
   border-radius: 2px;
 }
 
+.ghost-suggestion {
+  color: var(--fg);
+  opacity: 0.35;
+  pointer-events: none;
+  user-select: none;
+}
+
 /* ---- Terminal lines ---- */
 
 .term-line {

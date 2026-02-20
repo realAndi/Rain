@@ -320,6 +320,45 @@ export async function saveTextToFile(content: string, defaultName: string): Prom
   return invoke<boolean>("save_text_to_file", { content, defaultName });
 }
 
+// --- filesystem ---
+
+export interface DirEntry {
+  name: string;
+  isDir: boolean;
+}
+
+export async function listDirectory(path: string): Promise<DirEntry[]> {
+  return invoke<DirEntry[]>("list_directory", { path });
+}
+
+export interface ProjectScript {
+  name: string;
+  runner: string;
+}
+
+export interface ProjectCommands {
+  scripts: ProjectScript[];
+  projectType: string | null;
+}
+
+export async function scanProjectCommands(cwd: string): Promise<ProjectCommands> {
+  return invoke<ProjectCommands>("scan_project_commands", { cwd });
+}
+
+export async function scanPathCommands(): Promise<string[]> {
+  return invoke<string[]>("scan_path_commands");
+}
+
+export interface SnoopResult {
+  files: string[];
+  entryPoints: string[];
+  scripts: ProjectScript[];
+}
+
+export async function snoopPathContext(dir: string, runtime: string): Promise<SnoopResult> {
+  return invoke<SnoopResult>("snoop_path_context", { dir, runtime });
+}
+
 // --- version ---
 
 export async function getAppVersion(): Promise<string> {

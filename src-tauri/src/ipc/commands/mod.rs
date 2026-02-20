@@ -1,12 +1,14 @@
 #![allow(unused_imports)]
 
 pub mod config;
+pub mod filesystem;
 pub mod session;
 pub mod tmux;
 pub mod transfer;
 pub mod window;
 
 // Re-export all commands for external use (e.g. ipc::commands::create_session)
+pub use filesystem::{list_directory, scan_path_commands, scan_project_commands, snoop_path_context};
 pub use config::{
     get_app_version,
     load_workspace,

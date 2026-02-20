@@ -1661,6 +1661,7 @@ const App: Component = () => {
                     node={tree()}
                     stores={tabs.stores}
                     activePaneId={tab.activePaneId || tabs.getActivePaneId(tab.id)}
+                    isTabActive={index() === tabs.state.activeIndex}
                     onPaneActivate={(paneId) => {
                       tabs.setActivePane(tab.id, paneId);
                       const paneStore = tabs.stores.get(paneId);

@@ -16,6 +16,8 @@ export interface PaneContainerProps {
   onSplitDown?: (paneId: string) => void;
   /** True when this container is inside a split (has sibling panes) */
   isSplit?: boolean;
+  /** True when the parent tab is the currently visible/active tab */
+  isTabActive?: boolean;
 }
 
 export const PaneContainer: Component<PaneContainerProps> = (props) => {
@@ -28,6 +30,7 @@ export const PaneContainer: Component<PaneContainerProps> = (props) => {
           store={props.stores.get(props.node.id)}
           isActive={props.activePaneId === props.node.id}
           isSplit={!!props.isSplit}
+          isTabActive={props.isTabActive}
           onActivate={() => props.onPaneActivate(props.node.id)}
           onOpenSettings={props.onOpenSettings}
           onSplitRight={() => props.onSplitRight?.(props.node.id)}
@@ -39,6 +42,7 @@ export const PaneContainer: Component<PaneContainerProps> = (props) => {
         node={props.node as import("../lib/types").PaneSplit}
         stores={props.stores}
         activePaneId={props.activePaneId}
+        isTabActive={props.isTabActive}
         onPaneActivate={props.onPaneActivate}
         onOpenSettings={props.onOpenSettings}
         onSplitRight={props.onSplitRight}
@@ -53,6 +57,7 @@ const PaneLeafView: Component<{
   store: TerminalStore | undefined;
   isActive: boolean;
   isSplit: boolean;
+  isTabActive?: boolean;
   onActivate: () => void;
   onOpenSettings?: () => void;
   onSplitRight?: () => void;
@@ -81,6 +86,7 @@ const PaneLeafView: Component<{
               <Terminal
                 store={s()}
                 active={true}
+                isTabActive={props.isTabActive}
                 onOpenSettings={props.onOpenSettings}
                 onSplitRight={props.onSplitRight}
                 onSplitDown={props.onSplitDown}
@@ -99,6 +105,7 @@ const PaneSplitView: Component<{
   node: import("../lib/types").PaneSplit;
   stores: Map<string, TerminalStore>;
   activePaneId: string;
+  isTabActive?: boolean;
   onPaneActivate: (paneId: string) => void;
   onOpenSettings?: () => void;
   onSplitRight?: (paneId: string) => void;
@@ -168,6 +175,7 @@ const PaneSplitView: Component<{
           node={props.node.first}
           stores={props.stores}
           activePaneId={props.activePaneId}
+          isTabActive={props.isTabActive}
           onPaneActivate={props.onPaneActivate}
           onOpenSettings={props.onOpenSettings}
           onSplitRight={props.onSplitRight}
@@ -193,6 +201,7 @@ const PaneSplitView: Component<{
           node={props.node.second}
           stores={props.stores}
           activePaneId={props.activePaneId}
+          isTabActive={props.isTabActive}
           onPaneActivate={props.onPaneActivate}
           onOpenSettings={props.onOpenSettings}
           onSplitRight={props.onSplitRight}

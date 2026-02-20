@@ -195,6 +195,10 @@ pub fn run() {
             ipc::commands::window::register_global_hotkey,
             ipc::commands::config::save_text_to_file,
             ipc::commands::config::get_app_version,
+            ipc::commands::filesystem::list_directory,
+            ipc::commands::filesystem::scan_project_commands,
+            ipc::commands::filesystem::scan_path_commands,
+            ipc::commands::filesystem::snoop_path_context,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

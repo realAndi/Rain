@@ -38,6 +38,10 @@ export function createInputBuffer() {
     selectionEnd: null,
   });
 
+  const [suggestion, setSuggestion] = createSignal<string | null>(null);
+  const [allSuggestions, setAllSuggestions] = createSignal<string[]>([]);
+  const [suggestionIndex, setSuggestionIndex] = createSignal(0);
+
   let history: string[] = loadHistory();
   let historyIndex = -1;
   let historyDraft = "";
@@ -319,8 +323,75 @@ export function createInputBuffer() {
     resetHistory();
   }
 
+  function getHistory(): string[] {
+    return history;
+  }
+
+  function acceptSuggestion(): boolean {
+    const s = suggestion();
+    if (!s) return false;
+    update({ text: s, cursorPos: s.length, selectionStart: null, selectionEnd: null });
+    setSuggestion(null);
+    setAllSuggestions([]);
+    setSuggestionIndex(0);
+    resetHistory();
+    return true;
+  }
+
+  function dismissSuggestion(): boolean {
+    if (!suggestion()) return false;
+    setSuggestion(null);
+    setAllSuggestions([]);
+    setSuggestionIndex(0);
+    return true;
+  }
+
+  function acceptSuggestionWord(): boolean {
+    const s = suggestion();
+    if (!s) return false;
+    const current = state().text;
+    const remaining = s.slice(current.length);
+    if (!remaining) return false;
+
+    // Accept up to the next word boundary: space, or the end of a path segment (/)
+    // "checkout " -> accept "checkout "
+    // "src/components/" -> accept "src/"
+    // "/foo" -> accept "/foo" (leading slash + word)
+    const match = remaining.match(/^[^\s/]*[/\s]?/);
+    const chunk = match && match[0] ? match[0] : remaining;
+    const newText = current + chunk;
+    update({ text: newText, cursorPos: newText.length, selectionStart: null, selectionEnd: null });
+    if (newText === s) {
+      setSuggestion(null);
+      setAllSuggestions([]);
+      setSuggestionIndex(0);
+    }
+    return true;
+  }
+
+  function cycleSuggestion(direction: 1 | -1): boolean {
+    const all = allSuggestions();
+    if (all.length <= 1) return false;
+    const idx = suggestionIndex();
+    const newIdx = (idx + direction + all.length) % all.length;
+    setSuggestionIndex(newIdx);
+    setSuggestion(all[newIdx]);
+    return true;
+  }
+
   return {
     state,
+    suggestion,
+    setSuggestion,
+    allSuggestions,
+    setAllSuggestions,
+    suggestionIndex,
+    setSuggestionIndex,
+    acceptSuggestion,
+    dismissSuggestion,
+    acceptSuggestionWord,
+    cycleSuggestion,
+    getHistory,
     insert,
     deleteSelection,
     backspace,
