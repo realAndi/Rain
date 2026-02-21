@@ -13,7 +13,7 @@ import { useTheme, THEME_LIST } from "../stores/theme";
 import {
   computeBlurProfile,
 } from "../lib/glass";
-import { setAppIcon, saveTextToFile } from "../lib/ipc";
+import { saveTextToFile } from "../lib/ipc";
 import {
   LIQUID_GLASS_VARIANTS,
   isLiquidGlassSupported,
@@ -566,25 +566,6 @@ export const Settings: Component = () => {
               </div>
             </div>
 
-            {/* App Icon */}
-            <div class="settings-card">
-              <h3 class="settings-card-title">App Icon</h3>
-              <div class="settings-field">
-                <label class="settings-label">Dock icon style</label>
-                <select
-                  class="settings-input"
-                  value={config().appIcon}
-                  onChange={(e) => {
-                    const icon = e.currentTarget.value as "default" | "simple";
-                    updateConfig({ appIcon: icon });
-                    setAppIcon(icon).catch(console.warn);
-                  }}
-                >
-                  <option value="default">Default</option>
-                  <option value="simple">Simple</option>
-                </select>
-              </div>
-            </div>
 
             {/* Background Effects */}
             <div class="settings-card">
@@ -1276,6 +1257,31 @@ export const Settings: Component = () => {
                   <span class="settings-number-unit">lines</span>
                 </div>
               </div>
+
+              <div class="settings-field">
+                <label class="settings-label">Command History Limit</label>
+                <p class="settings-hint">
+                  Maximum completed command blocks kept in memory (100 - 10,000). Lower values reduce memory usage during long sessions.
+                </p>
+                <div class="settings-number-input">
+                  <input
+                    class="settings-input settings-input-wide"
+                    type="number"
+                    min="100"
+                    max="10000"
+                    step="100"
+                    value={config().snapshotLimit}
+                    onInput={(e) => {
+                      const v = parseInt(e.currentTarget.value);
+                      if (!isNaN(v))
+                        updateConfig({
+                          snapshotLimit: Math.min(10000, Math.max(100, v)),
+                        });
+                    }}
+                  />
+                  <span class="settings-number-unit">blocks</span>
+                </div>
+              </div>
             </div>
 
             <div class="settings-card">
@@ -1283,17 +1289,26 @@ export const Settings: Component = () => {
               <div class="settings-field">
                 <label class="settings-label">Preferred Renderer</label>
                 <p class="settings-hint">
-                  DOM is the stable default. Canvas mode is experimental and used for inactive pane previews.
+                  Auto tries WebGL2 first for maximum GPU performance, then falls back to Canvas2D. WebGL forces WebGL2 (falls back to Canvas if unavailable). Canvas uses Canvas2D only. DOM uses browser layout and may be slower during heavy output.
                 </p>
                 <div class="settings-cursor-options">
                   <button
-                    class={`settings-cursor-option ${config().renderer === "dom" ? "settings-cursor-option-active" : ""}`}
-                    onClick={() => updateConfig({ renderer: "dom" })}
+                    class={`settings-cursor-option ${config().renderer === "auto" ? "settings-cursor-option-active" : ""}`}
+                    onClick={() => updateConfig({ renderer: "auto" })}
                   >
                     <div class="cursor-preview" style={{ "font-size": "9px", "align-items": "center", "justify-content": "center" }}>
-                      DOM
+                      Auto
                     </div>
-                    <span>DOM</span>
+                    <span>Auto</span>
+                  </button>
+                  <button
+                    class={`settings-cursor-option ${config().renderer === "webgl" ? "settings-cursor-option-active" : ""}`}
+                    onClick={() => updateConfig({ renderer: "webgl" })}
+                  >
+                    <div class="cursor-preview" style={{ "font-size": "9px", "align-items": "center", "justify-content": "center" }}>
+                      WebGL
+                    </div>
+                    <span>WebGL</span>
                   </button>
                   <button
                     class={`settings-cursor-option ${config().renderer === "canvas" ? "settings-cursor-option-active" : ""}`}
@@ -1303,6 +1318,15 @@ export const Settings: Component = () => {
                       Canvas
                     </div>
                     <span>Canvas</span>
+                  </button>
+                  <button
+                    class={`settings-cursor-option ${config().renderer === "dom" ? "settings-cursor-option-active" : ""}`}
+                    onClick={() => updateConfig({ renderer: "dom" })}
+                  >
+                    <div class="cursor-preview" style={{ "font-size": "9px", "align-items": "center", "justify-content": "center" }}>
+                      DOM
+                    </div>
+                    <span>DOM</span>
                   </button>
                 </div>
               </div>

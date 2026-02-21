@@ -38,12 +38,17 @@ import { CommandBlock } from "./terminal/CommandBlock";
 import { TraditionalBlock } from "./terminal/TraditionalBlock";
 import { WelcomeState } from "./terminal/WelcomeState";
 import { SearchBar } from "./terminal/SearchBar";
+import { CanvasTerminalRenderer, canUseCanvasRenderer, type CanvasRendererConfig } from "../lib/canvasRenderer";
+import { WebGLTerminalRenderer, canUseWebGLRenderer } from "../lib/webglRenderer";
+import { useTheme, THEME_LIST, THEME_ANSI_PALETTES } from "../stores/theme";
+import { colorToCSS } from "../lib/color";
 
 export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabActive?: boolean; onOpenSettings?: () => void; onSplitRight?: () => void; onSplitDown?: () => void }> = (props) => {
   let containerRef!: HTMLDivElement;
   let scrollRef!: HTMLDivElement;
   let srAnnouncerRef: HTMLDivElement | undefined;
   const { config } = useConfig();
+  const { theme } = useTheme();
   const inputBuffer = createInputBuffer();
 
   const suggestionEngine = new SuggestionEngine();
@@ -448,12 +453,13 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     }
   ));
 
-  // Track scroll position for FAB
+  // Track scroll position for FAB and snapshot virtualization
   const handleScroll = () => {
     if (!scrollRef) return;
     const threshold = 50;
     const isAtBottom = scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight < threshold;
     setIsScrolledUp(!isAtBottom);
+    setScrollTop(scrollRef.scrollTop);
   };
 
   const scrollToBottom = () => {
@@ -555,11 +561,20 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
 
   // Mouse event handlers for PTY mouse reporting + text selection
   const handleTermMouseDown = (e: MouseEvent) => {
-    const viewport = containerRef?.querySelector(".terminal-content, .alt-screen, .active-viewport, .terminal-history") as HTMLElement;
+    const viewport = containerRef?.querySelector(".terminal-content, .alt-screen, .active-viewport, .canvas-terminal, .terminal-history") as HTMLElement;
     if (!viewport) return;
     const { row, col } = pixelToGrid(e, viewport);
 
-    // Mouse tracking mode: send to PTY (unless Shift is held for selection override)
+    if ((e.metaKey || e.ctrlKey) && activeCanvasRenderer) {
+      const url = activeCanvasRenderer.getUrlAt(row, col);
+      if (url) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.open(url, "_blank");
+        return;
+      }
+    }
+
     if (props.store.state.mouseTracking && !e.shiftKey) {
       e.preventDefault();
       containerRef?.focus();
@@ -572,9 +587,6 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
       return;
     }
 
-    // Text selection
-    // Allow native browser selection for completed output blocks.
-    // Keep custom grid-based selection for the active viewport/alt-screen.
     const target = e.target as HTMLElement;
     if (target.closest(".command-block, .traditional-block")) {
       containerRef?.focus();
@@ -604,8 +616,20 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
   };
 
   const handleTermMouseMove = (e: MouseEvent) => {
+    if (activeCanvasRenderer && (e.metaKey || e.ctrlKey)) {
+      const canvasEl = containerRef?.querySelector(".canvas-terminal") as HTMLElement;
+      if (canvasEl) {
+        const { row, col } = pixelToGrid(e, canvasEl);
+        const url = activeCanvasRenderer.getUrlAt(row, col);
+        canvasEl.style.cursor = url ? "pointer" : "";
+      }
+    } else {
+      const canvasEl = containerRef?.querySelector(".canvas-terminal") as HTMLElement;
+      if (canvasEl) canvasEl.style.cursor = "";
+    }
+
     if (!mouseButtonDown && !props.store.state.mouseAllMotion) return;
-    const viewport = containerRef?.querySelector(".terminal-content, .alt-screen, .active-viewport, .terminal-history") as HTMLElement;
+    const viewport = containerRef?.querySelector(".terminal-content, .alt-screen, .active-viewport, .canvas-terminal, .terminal-history") as HTMLElement;
     if (!viewport) return;
     const { row, col } = pixelToGrid(e, viewport);
 
@@ -1055,6 +1079,207 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     );
   });
 
+  const m = () => metrics();
+  const lineHeight = () => m()?.lineHeight ?? 20;
+  const fontFamily = () => {
+    const f = m()?.fontFamily;
+    return f ? `"${f}", monospace` : "monospace";
+  };
+  const fontSize = () => m()?.fontSize ?? 14;
+  const charWidth = () => m()?.charWidth ?? 8;
+
+  const useCanvasViewport = () => config().renderer !== "dom" && canUseCanvasRenderer();
+  let activeCanvasRef: HTMLCanvasElement | undefined;
+  let activeCanvasRenderer: CanvasTerminalRenderer | WebGLTerminalRenderer | null = null;
+
+  function ensureCanvasRenderer(canvas: HTMLCanvasElement) {
+    if (activeCanvasRenderer) return activeCanvasRenderer;
+    const cfg = config();
+    const themeEntry = THEME_LIST.find((t) => t.name === theme());
+    const rendererConfig: CanvasRendererConfig = {
+      fontFamily: cfg.fontFamily,
+      fontSize: cfg.fontSize,
+      lineHeight: cfg.lineHeight,
+      letterSpacing: cfg.letterSpacing,
+      cols: props.store.state.cols || 80,
+      rows: props.store.state.rows || 24,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      defaultFg: themeEntry?.accent ?? "#e0e0e0",
+      defaultBg: themeEntry?.bg ?? "#0e0e0e",
+    };
+
+    const rendererPref = cfg.renderer ?? "auto";
+    if (rendererPref !== "canvas" && canUseWebGLRenderer()) {
+      try {
+        activeCanvasRenderer = new WebGLTerminalRenderer(canvas, rendererConfig);
+        activeCanvasRenderer.startRenderLoop();
+        return activeCanvasRenderer;
+      } catch {
+        // WebGL2 init failed -- fall through to Canvas2D
+      }
+    }
+
+    activeCanvasRenderer = new CanvasTerminalRenderer(canvas, rendererConfig);
+    activeCanvasRenderer.startRenderLoop();
+    return activeCanvasRenderer;
+  }
+
+  function destroyCanvasRenderer() {
+    if (activeCanvasRenderer) {
+      activeCanvasRenderer.destroy();
+      activeCanvasRenderer = null;
+    }
+  }
+
+  createEffect(() => {
+    if (!useCanvasViewport()) {
+      destroyCanvasRenderer();
+      return;
+    }
+    if (!activeCanvasRef) return;
+    const renderer = ensureCanvasRenderer(activeCanvasRef);
+    const rows = props.store.state.rows || 24;
+    const cols = props.store.state.cols || 80;
+    renderer.resize(cols, rows);
+  });
+
+  createEffect(() => {
+    if (!useCanvasViewport() || !activeCanvasRenderer) return;
+
+    let lines: RenderedLine[];
+    if (props.store.state.altScreen) {
+      lines = props.store.state.altScreenLines;
+    } else if (props.store.state.activeBlock) {
+      lines = primaryScreenLines();
+    } else if (!props.store.state.shellIntegrationActive) {
+      lines = fallbackOutputLines() ?? [];
+    } else {
+      lines = props.store.state.fallbackLines;
+    }
+
+    const palette = THEME_ANSI_PALETTES[theme()] ?? THEME_ANSI_PALETTES["dark"];
+    for (const line of lines) {
+      activeCanvasRenderer.updateLine(
+        line.index,
+        line.spans.map((s) => ({
+          text: s.text,
+          fg: colorToCSS(s.fg, palette) ?? "#e0e0e0",
+          bg: colorToCSS(s.bg, palette) ?? "transparent",
+          bold: s.bold,
+          italic: s.italic,
+          underline: s.underline,
+          strikethrough: s.strikethrough,
+          dim: s.dim,
+        })),
+      );
+    }
+
+    const sel = selection();
+    if (sel.active && sel.range) {
+      const norm = normalizeRange(sel.range);
+      activeCanvasRenderer.renderSelection(
+        norm.start.row,
+        norm.start.col,
+        norm.end.row,
+        norm.end.col,
+        "var(--selection-bg, #ffffff)",
+      );
+    }
+
+    const matches = props.store.state.searchMatches;
+    if (matches.length > 0) {
+      const currentIdx = props.store.state.searchCurrentIndex;
+      activeCanvasRenderer.renderSearchMatches(
+        matches.map((m, i) => ({
+          row: m.globalRow,
+          startCol: m.startCol,
+          endCol: m.endCol,
+          isCurrent: i === currentIdx,
+        })),
+        "#888888",
+        "#ffff00",
+      );
+    }
+
+    const cursor = props.store.state.cursor;
+    if (cursor.visible) {
+      activeCanvasRenderer.renderCursor(
+        cursor.row,
+        cursor.col,
+        cursor.shape,
+        config().customCursorColor ?? "#e0e0e0",
+      );
+    }
+  });
+
+  onCleanup(destroyCanvasRenderer);
+
+  // Snapshot virtualization: estimate block heights and only render visible ones
+  const VIRTUAL_OVERSCAN = 5;
+
+  const snapshotHeights = createMemo(() => {
+    const lh = lineHeight();
+    const traditional = isTraditional();
+    return props.store.state.snapshots.map((snap) => {
+      const outputLines = Math.max(0, snap.lines.length);
+      const headerPx = traditional ? 0 : 44;
+      const commandPx = snap.command ? lh : 0;
+      const footerPx = snap.endTime != null ? 28 : 0;
+      const padding = traditional ? 8 : 24;
+      return outputLines * lh + headerPx + commandPx + footerPx + padding;
+    });
+  });
+
+  const [scrollTop, setScrollTop] = createSignal(0);
+
+  const visibleSnapshotRange = createMemo(() => {
+    const heights = snapshotHeights();
+    const total = heights.length;
+    if (total === 0) return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
+
+    const viewTop = scrollTop();
+    const viewBottom = viewTop + containerHeight();
+
+    let cumHeight = 0;
+    let startIdx = 0;
+    for (; startIdx < total; startIdx++) {
+      if (cumHeight + heights[startIdx] >= viewTop) break;
+      cumHeight += heights[startIdx];
+    }
+    const topPad = cumHeight;
+
+    const overscanStart = Math.max(0, startIdx - VIRTUAL_OVERSCAN);
+    let overscanTopPad = topPad;
+    for (let i = startIdx - 1; i >= overscanStart; i--) {
+      overscanTopPad -= heights[i];
+    }
+
+    let endIdx = startIdx;
+    for (; endIdx < total; endIdx++) {
+      cumHeight += heights[endIdx];
+      if (cumHeight > viewBottom) { endIdx++; break; }
+    }
+    const overscanEnd = Math.min(total, endIdx + VIRTUAL_OVERSCAN);
+
+    let totalHeight = 0;
+    for (const h of heights) totalHeight += h;
+    let visibleHeight = 0;
+    for (let i = overscanStart; i < overscanEnd; i++) visibleHeight += heights[i];
+    const bottomPad = Math.max(0, totalHeight - overscanTopPad - visibleHeight);
+
+    return {
+      start: overscanStart,
+      end: overscanEnd,
+      topPad: Math.max(0, overscanTopPad),
+      bottomPad,
+    };
+  });
+
+  const visibleSnapshots = createMemo(() => {
+    const { start, end } = visibleSnapshotRange();
+    return props.store.state.snapshots.slice(start, end);
+  });
+
   // Auto-scroll to bottom (skip while keeping history visible for TUIs)
   createEffect(() => {
     const _ = (activeOutputLines() ?? []).length;
@@ -1480,15 +1705,6 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     return { text: formatCwdSimplified(cwd), char: "$" };
   };
 
-  const m = () => metrics();
-  const lineHeight = () => m()?.lineHeight ?? 20;
-  const fontFamily = () => {
-    const f = m()?.fontFamily;
-    return f ? `"${f}", monospace` : "monospace";
-  };
-  const fontSize = () => m()?.fontSize ?? 14;
-  const charWidth = () => m()?.charWidth ?? 8;
-
   // Cursor blink reset: toggle a key to restart CSS animation on input
   const [blinkKey, setBlinkKey] = createSignal(0);
   function resetBlink() {
@@ -1682,26 +1898,36 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
       </Show>
       {/* Fullscreen TUI: absolute overlay when setting is enabled */}
       <Show when={fullscreenTui()}>
-        <div class="alt-screen">
-          <div class="terminal-content" style={{ position: "relative" }}>
-            <For each={buildFullGrid(props.store.state.altScreenLines, props.store.state.rows)}>
-              {(line) => (
-                <TerminalLine
-                  line={line}
-                  charWidth={charWidth()}
-                  selectionRange={selection().range}
-                  searchMatches={props.store.state.searchMatches}
-                  searchCurrentIndex={props.store.state.searchCurrentIndex}
-                />
-              )}
-            </For>
-            <Cursor
-              cursor={props.store.state.cursor}
-              charWidth={charWidth()}
-              lineHeight={lineHeight()}
+        <Show when={useCanvasViewport()} fallback={
+          <div class="alt-screen">
+            <div class="terminal-content" style={{ position: "relative" }}>
+              <For each={buildFullGrid(props.store.state.altScreenLines, props.store.state.rows)}>
+                {(line) => (
+                  <TerminalLine
+                    line={line}
+                    charWidth={charWidth()}
+                    selectionRange={selection().range}
+                    searchMatches={props.store.state.searchMatches}
+                    searchCurrentIndex={props.store.state.searchCurrentIndex}
+                  />
+                )}
+              </For>
+              <Cursor
+                cursor={props.store.state.cursor}
+                charWidth={charWidth()}
+                lineHeight={lineHeight()}
+              />
+            </div>
+          </div>
+        }>
+          <div class="alt-screen">
+            <canvas
+              ref={activeCanvasRef}
+              class="canvas-terminal"
+              style={{ display: "block", width: "100%", height: "100%" }}
             />
           </div>
-        </div>
+        </Show>
       </Show>
 
       <Show when={!fullscreenTui()}>
@@ -1726,9 +1952,14 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                 <WelcomeState />
               </Show>
 
-              {/* Chat mode: command blocks as cards */}
+              {/* Virtualized spacer for blocks scrolled above viewport */}
+              <Show when={visibleSnapshotRange().topPad > 0}>
+                <div style={{ height: `${visibleSnapshotRange().topPad}px` }} aria-hidden="true" />
+              </Show>
+
+              {/* Chat mode: command blocks as cards (virtualized) */}
               <Show when={!isTraditional()}>
-                <For each={props.store.state.snapshots}>
+                <For each={visibleSnapshots()}>
                   {(snap) => (
                     <CommandBlock
                       snapshot={snap}
@@ -1739,9 +1970,9 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                 </For>
               </Show>
 
-              {/* Traditional mode: continuous output */}
+              {/* Traditional mode: continuous output (virtualized) */}
               <Show when={isTraditional()}>
-                <For each={props.store.state.snapshots}>
+                <For each={visibleSnapshots()}>
                   {(snap) => (
                     <TraditionalBlock
                       snapshot={snap}
@@ -1752,20 +1983,33 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                 </For>
               </Show>
 
+              {/* Virtualized spacer for blocks scrolled below viewport */}
+              <Show when={visibleSnapshotRange().bottomPad > 0}>
+                <div style={{ height: `${visibleSnapshotRange().bottomPad}px` }} aria-hidden="true" />
+              </Show>
+
               <Show when={!props.store.state.shellIntegrationActive && hasRenderableFallbackContent()}>
-                <div class="active-output">
-                  <For each={fallbackOutputLines()}>
-                    {(line) => (
-                      <TerminalLine
-                        line={line}
-                        charWidth={charWidth()}
-                        selectionRange={selection().range}
-                        searchMatches={props.store.state.searchMatches}
-                        searchCurrentIndex={props.store.state.searchCurrentIndex}
-                      />
-                    )}
-                  </For>
-                </div>
+                <Show when={useCanvasViewport()} fallback={
+                  <div class="active-output">
+                    <For each={fallbackOutputLines()}>
+                      {(line) => (
+                        <TerminalLine
+                          line={line}
+                          charWidth={charWidth()}
+                          selectionRange={selection().range}
+                          searchMatches={props.store.state.searchMatches}
+                          searchCurrentIndex={props.store.state.searchCurrentIndex}
+                        />
+                      )}
+                    </For>
+                  </div>
+                }>
+                  <canvas
+                    ref={activeCanvasRef}
+                    class="canvas-terminal active-output"
+                    style={{ display: "block", width: "100%", "min-height": `${(props.store.state.rows || 24) * lineHeight()}px` }}
+                  />
+                </Show>
               </Show>
 
               {/* Active block: always show so the prompt/path is visible.
@@ -1843,9 +2087,43 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
 
           {/* Inline TUI viewport: alt-screen content rendered in document flow */}
           <Show when={inlineTui()}>
-            <div class="alt-screen-inline">
-              <div class="terminal-content" style={{ position: "relative" }}>
-                <For each={buildFullGrid(props.store.state.altScreenLines, props.store.state.rows)}>
+            <Show when={useCanvasViewport()} fallback={
+              <div class="alt-screen-inline">
+                <div class="terminal-content" style={{ position: "relative" }}>
+                  <For each={buildFullGrid(props.store.state.altScreenLines, props.store.state.rows)}>
+                    {(line) => (
+                      <TerminalLine
+                        line={line}
+                        charWidth={charWidth()}
+                        selectionRange={selection().range}
+                        searchMatches={props.store.state.searchMatches}
+                        searchCurrentIndex={props.store.state.searchCurrentIndex}
+                      />
+                    )}
+                  </For>
+                  <Cursor
+                    cursor={props.store.state.cursor}
+                    charWidth={charWidth()}
+                    lineHeight={lineHeight()}
+                  />
+                </div>
+              </div>
+            }>
+              <div class="alt-screen-inline">
+                <canvas
+                  ref={activeCanvasRef}
+                  class="canvas-terminal"
+                  style={{ display: "block", width: "100%", "min-height": `${(props.store.state.rows || 24) * lineHeight()}px` }}
+                />
+              </div>
+            </Show>
+          </Show>
+
+          {/* Active command: render full viewport lines inline (not during inline TUI) */}
+          <Show when={!!props.store.state.activeBlock && !inlineTui()}>
+            <Show when={useCanvasViewport()} fallback={
+              <div class="terminal-content active-viewport" style={{ position: "relative" }}>
+                <For each={primaryScreenLines()}>
                   {(line) => (
                     <TerminalLine
                       line={line}
@@ -1857,35 +2135,19 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   )}
                 </For>
                 <Cursor
-                  cursor={props.store.state.cursor}
+                  cursor={primaryScreenCursor()}
                   charWidth={charWidth()}
                   lineHeight={lineHeight()}
+                  blinking={false}
                 />
               </div>
-            </div>
-          </Show>
-
-          {/* Active command: render full viewport lines inline (not during inline TUI) */}
-          <Show when={!!props.store.state.activeBlock && !inlineTui()}>
-            <div class="terminal-content active-viewport" style={{ position: "relative" }}>
-              <For each={primaryScreenLines()}>
-                {(line) => (
-                  <TerminalLine
-                    line={line}
-                    charWidth={charWidth()}
-                    selectionRange={selection().range}
-                    searchMatches={props.store.state.searchMatches}
-                    searchCurrentIndex={props.store.state.searchCurrentIndex}
-                  />
-                )}
-              </For>
-              <Cursor
-                cursor={primaryScreenCursor()}
-                charWidth={charWidth()}
-                lineHeight={lineHeight()}
-                blinking={false}
+            }>
+              <canvas
+                ref={activeCanvasRef}
+                class="canvas-terminal active-viewport"
+                style={{ display: "block", width: "100%", "min-height": `${(props.store.state.rows || 24) * lineHeight()}px` }}
               />
-            </div>
+            </Show>
           </Show>
         </div>
 

@@ -84,23 +84,24 @@ const SpanElement: Component<SpanElementProps> = (props) => {
     return s;
   };
 
-  // Check if we have any selection or search highlighting to do
+  const hasSelection = () => !!props.selectionRange;
+  const hasSearchMatches = () => !!(props.searchMatches && props.searchMatches.length > 0);
+
   const segments = createMemo(() => {
+    if (!hasSelection() && !hasSearchMatches()) return null;
+
     const text = props.span.text;
     const row = props.row;
     const baseCol = props.colOffset;
 
-    // Build highlight ranges for this span
     type Highlight = { start: number; end: number; type: "selection" | "search" | "search-current" };
     const highlights: Highlight[] = [];
 
-    // Selection highlighting
     if (props.selectionRange) {
       const norm = normalizeRange(props.selectionRange);
       for (let i = 0; i < text.length; i++) {
         const col = baseCol + i;
         if (isCellSelected(norm, row, col)) {
-          // Find the run of selected chars
           let end = i;
           while (end + 1 < text.length && isCellSelected(norm, row, baseCol + end + 1)) {
             end++;
@@ -111,10 +112,9 @@ const SpanElement: Component<SpanElementProps> = (props) => {
       }
     }
 
-    // Search match highlighting
-    if (props.searchMatches && props.searchMatches.length > 0) {
-      for (let mi = 0; mi < props.searchMatches.length; mi++) {
-        const match = props.searchMatches[mi];
+    if (hasSearchMatches()) {
+      for (let mi = 0; mi < props.searchMatches!.length; mi++) {
+        const match = props.searchMatches![mi];
         if (match.globalRow !== row) continue;
 
         const spanStart = Math.max(0, match.startCol - baseCol);
@@ -131,19 +131,13 @@ const SpanElement: Component<SpanElementProps> = (props) => {
       }
     }
 
-    if (highlights.length === 0) {
-      return null; // No highlighting, render simple span
-    }
+    if (highlights.length === 0) return null;
 
-    // Split text into segments with their highlight types
     type Segment = { text: string; highlights: Set<string> };
     const segs: Segment[] = [];
-    let pos = 0;
 
-    // Sort highlights by start position
     highlights.sort((a, b) => a.start - b.start);
 
-    // Build breakpoints
     const breakpoints = new Set<number>();
     breakpoints.add(0);
     breakpoints.add(text.length);
@@ -173,14 +167,16 @@ const SpanElement: Component<SpanElementProps> = (props) => {
     return segs;
   });
 
-  // URL detection for clickable links
   const urls = createMemo(() => {
     if (props.span.url) return [{ start: 0, end: props.span.text.length, url: props.span.url }];
+
+    const text = props.span.text;
+    if (text.length < 8 || !text.includes("://")) return [];
 
     const matches: Array<{ start: number; end: number; url: string }> = [];
     let match: RegExpExecArray | null;
     const regex = new RegExp(URL_REGEX.source, "g");
-    while ((match = regex.exec(props.span.text)) !== null) {
+    while ((match = regex.exec(text)) !== null) {
       matches.push({
         start: match.index,
         end: match.index + match[0].length,

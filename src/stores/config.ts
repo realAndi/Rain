@@ -17,6 +17,7 @@ export interface RainConfig {
   cursorShape: "block" | "underline" | "bar";
   optionAsMeta: boolean;
   scrollbackLines: number;
+  snapshotLimit: number;
   customBgColor: string | null;
   customFgColor: string | null;
   customAccentColor: string | null;
@@ -39,9 +40,8 @@ export interface RainConfig {
   statusBarShowConnection: boolean;
   clearHistoryForTuis: boolean;
   enableLigatures: boolean;
-  appIcon: "default" | "simple";
   globalHotkey: string | null;
-  renderer: "dom" | "canvas";
+  renderer: "dom" | "canvas" | "webgl" | "auto";
 }
 
 const STORAGE_KEY = "rain-config";
@@ -66,6 +66,7 @@ const defaultConfig: RainConfig = {
   cursorShape: "block",
   optionAsMeta: true,
   scrollbackLines: 10_000,
+  snapshotLimit: 1_000,
   customBgColor: null,
   customFgColor: null,
   customAccentColor: null,
@@ -88,9 +89,8 @@ const defaultConfig: RainConfig = {
   statusBarShowConnection: true,
   clearHistoryForTuis: false,
   enableLigatures: true,
-  appIcon: "default",
   globalHotkey: null,
-  renderer: "dom",
+  renderer: "auto",
 };
 
 function clampOpacity(value: number): number {
@@ -275,7 +275,6 @@ export function useConfig() {
           liquidVariant: defaultConfig.liquidVariant,
           liquidCornerRadius: defaultConfig.liquidCornerRadius,
           liquidTintColor: defaultConfig.liquidTintColor,
-          appIcon: defaultConfig.appIcon,
           customBgColor: null,
           customFgColor: null,
           customAccentColor: null,
@@ -295,6 +294,7 @@ export function useConfig() {
           cursorShape: defaultConfig.cursorShape,
           optionAsMeta: defaultConfig.optionAsMeta,
           scrollbackLines: defaultConfig.scrollbackLines,
+          snapshotLimit: defaultConfig.snapshotLimit,
           promptStyle: defaultConfig.promptStyle,
           terminalStyle: defaultConfig.terminalStyle,
           tmuxMode: defaultConfig.tmuxMode,

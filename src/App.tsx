@@ -30,7 +30,6 @@ import {
   onResizeAck,
   onSessionEnded,
   requestFullRedraw,
-  setAppIcon,
   setWindowBlurRadius,
   setWindowOpacity,
   writeInput,
@@ -89,6 +88,17 @@ const THEME_ACCENT_MAP = new Map(
 const ADOPT_TRANSFER_FALLBACK_MS = 18000;
 const ADOPT_TRANSFER_POLL_MS = 120;
 
+function isDevLogEnabled(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem("rain:debug-logs") === "1";
+  } catch { return false; }
+}
+const _devLogEnabled = isDevLogEnabled();
+function devLog(...args: unknown[]) {
+  if (_devLogEnabled) console.log(...args);
+}
+
 type AdoptProgressState = {
   transferId: string;
   label: string;
@@ -112,6 +122,26 @@ const App: Component = () => {
   const [updateInfo, setUpdateInfo] = createSignal<UpdateInfo | null>(null);
   let glassEffectRunSeq = 0;
   const pendingFrames = new Map<string, RenderFramePayload[]>();
+
+  const deferredFrames = new Map<string, RenderFramePayload[]>();
+  let drainScheduled = false;
+  function scheduleDrainDeferred() {
+    if (drainScheduled) return;
+    drainScheduled = true;
+    requestAnimationFrame(() => {
+      drainScheduled = false;
+      for (const [sessionId, frames] of deferredFrames) {
+        if (frames.length === 0) continue;
+        const store = tabs.getStoreBySessionId(sessionId);
+        if (!store) continue;
+        for (const frame of frames) {
+          store.applyRenderFrame(frame);
+        }
+        markSessionRedrawn(sessionId);
+      }
+      deferredFrames.clear();
+    });
+  }
   const adoptProgressByTransfer = new Map<string, {
     label: string;
     total: number;
@@ -351,7 +381,7 @@ const App: Component = () => {
         config().tmuxMode,
       );
       const sessionId = result.session_id;
-      console.log("[Rain] Session created:", sessionId, result.inside_tmux ? "(inside tmux)" : "");
+      devLog("[Rain] Session created:", sessionId, result.inside_tmux ? "(inside tmux)" : "");
 
       const profileLabel = profile?.id && profile.id !== "default" ? profile.name : "Shell";
       const tab = tabs.addTab(sessionId, profileLabel, undefined, cwd);
@@ -737,7 +767,7 @@ const App: Component = () => {
       if (tab) setTmuxOriginTab(tab.id);
 
       await tmuxStart(args || undefined);
-      console.log("[Rain] tmux control mode started");
+      devLog("[Rain] tmux control mode started");
     } catch (err) {
       const msg = String(err ?? "");
       if (msg.includes("tmux session already active")) {
@@ -867,7 +897,6 @@ const App: Component = () => {
     // Register all event listeners in parallel for faster startup
     const [unFrame, unEnd, unResizeAck, unTmux] = await Promise.all([
       onRenderFrame((payload) => {
-        // Intercept TmuxRequested events before store processing
         if (payload.frame?.events) {
           for (const ev of payload.frame.events) {
             if (ev.type === "TmuxRequested" && "args" in ev) {
@@ -876,14 +905,23 @@ const App: Component = () => {
           }
         }
 
-        // Route to the correct tab's store by session_id
         const store = tabs.getStoreBySessionId(payload.session_id);
         if (store) {
           flushPendingFrames(payload.session_id);
+
+          const alreadyDeferred = deferredFrames.get(payload.session_id);
+          if (alreadyDeferred && alreadyDeferred.length > 0) {
+            alreadyDeferred.push(payload);
+            return;
+          }
+
           store.applyRenderFrame(payload);
           markSessionRedrawn(payload.session_id);
+
+          const buf = deferredFrames.get(payload.session_id) ?? [];
+          deferredFrames.set(payload.session_id, buf);
+          scheduleDrainDeferred();
         } else {
-          // Store doesn't exist yet - buffer the frame
           let buf = pendingFrames.get(payload.session_id);
           if (!buf) {
             buf = [];
@@ -897,6 +935,8 @@ const App: Component = () => {
         if (store) {
           store.setState({ connected: false });
         }
+        deferredFrames.delete(payload.session_id);
+        pendingFrames.delete(payload.session_id);
       }),
       onResizeAck((payload) => {
         const store = tabs.getStoreBySessionId(payload.session_id);
@@ -1077,7 +1117,7 @@ const App: Component = () => {
       transferId?: string;
     }>("tab-adopt", (event) => {
       const { sessionId, label, cwd, insertX, transferId } = event.payload;
-      console.log("[Rain] Adopting tab from another window:", transferId ?? sessionId);
+      devLog("[Rain] Adopting tab from another window:", transferId ?? sessionId);
 
       const insertAt = insertIndexFromX(insertX);
 
@@ -1146,7 +1186,7 @@ const App: Component = () => {
     } else if (adoptSessionId) {
       const label = params.get("label") ?? "Shell";
       const cwd = params.get("cwd") ?? undefined;
-      console.log("[Rain] Adopting session:", adoptSessionId, "label:", label);
+      devLog("[Rain] Adopting session:", adoptSessionId, "label:", label);
       tabs.addTab(adoptSessionId, label, undefined, cwd);
       flushPendingFrames(adoptSessionId);
       hydrateTransferredSessionState(adoptSessionId);
@@ -1290,7 +1330,7 @@ const App: Component = () => {
       .then((sessions) => {
         if (sessions.length > 0) {
           setTmuxAvailableSessions(sessions);
-          console.log("[Rain] Found existing tmux sessions:", sessions.map((s) => s.name));
+          devLog("[Rain] Found existing tmux sessions:", sessions.map((s) => s.name));
         }
       })
       .catch(() => {
@@ -1356,13 +1396,6 @@ const App: Component = () => {
   createEffect(() => {
     setWindowOpacity(1.0).catch((e) =>
       console.warn("[Rain] Failed to set window opacity:", e),
-    );
-  });
-
-  // Apply dock icon from config on startup and when changed.
-  createEffect(() => {
-    setAppIcon(config().appIcon).catch((e) =>
-      console.warn("[Rain] Failed to set app icon:", e),
     );
   });
 

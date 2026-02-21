@@ -10,11 +10,6 @@ import { collectLinesForRange, trimTrailingEmpty } from "../lib/terminal-output"
 import { checkOutput, executeTriggerAction } from "../lib/triggers";
 import { useConfig } from "./config";
 
-// Request notification permission at startup
-if (typeof Notification !== "undefined" && Notification.permission === "default") {
-  Notification.requestPermission().catch(() => {});
-}
-
 export interface TerminalStore {
   state: TerminalStoreState;
   setState: ReturnType<typeof createStore<TerminalStoreState>>[1];
@@ -27,6 +22,35 @@ export interface TerminalStore {
 }
 
 let snapshotCounter = 0;
+
+const DEFAULT_SNAPSHOT_LIMIT = 1_000;
+
+function resolveSnapshotLimit(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_SNAPSHOT_LIMIT;
+  return Math.max(100, Math.floor(value));
+}
+
+function resolveScrollbackLimit(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 10_000;
+  return Math.max(1_000, Math.floor(value));
+}
+
+function pruneScrollbackLines(
+  scrollbackLines: RenderedLine[],
+  visibleBaseGlobal: number,
+  scrollbackLimit: number,
+): RenderedLine[] {
+  const minGlobal = Math.max(0, visibleBaseGlobal - scrollbackLimit);
+  if (minGlobal <= 0) return scrollbackLines;
+  return scrollbackLines.filter((line) => line.index >= minGlobal);
+}
+
+function getMaxScrollOffset(state: TerminalStoreState): number {
+  const lines = state.scrollbackLines;
+  if (lines.length === 0 || state.visibleBaseGlobal <= 0) return 0;
+  const oldest = lines[0]?.index ?? state.visibleBaseGlobal;
+  return Math.max(0, state.visibleBaseGlobal - oldest);
+}
 
 // Error patterns
 const ERROR_PATTERNS = [
@@ -56,8 +80,6 @@ function isClearCommand(command: string | null | undefined): boolean {
 }
 
 function resetStoreHistory(state: TerminalStoreState) {
-  // During alt screen (e.g. tmux is running), preserve block tracking
-  // and tmux state so the session can resume cleanly on exit.
   if (state.altScreen) {
     state.snapshots = [];
     state.scrollbackLines = [];
@@ -82,7 +104,6 @@ function resetStoreHistory(state: TerminalStoreState) {
 function isTmuxCommand(command: string): boolean {
   const trimmed = command.trim();
   if (!trimmed) return false;
-  // Match tmux invoked bare, shell-chained, or via absolute/relative path
   return /(^|[\s;&|/])tmux(\s|$)/.test(trimmed);
 }
 
@@ -150,14 +171,11 @@ export function createTerminalStore(): TerminalStore {
 
   function applyRenderFrame(payload: RenderFramePayload) {
     const { frame } = payload;
+    const snapshotLimit = resolveSnapshotLimit(config().snapshotLimit);
+    const scrollbackLimit = resolveScrollbackLimit(config().scrollbackLines);
 
     setState(
       produce((s) => {
-        // --- ALWAYS apply ALL events, even on stale frames ---
-        // Events are state transitions (shell integration, alt screen, title, etc.)
-        // that must never be dropped by epoch/seq gating. Dropping block events
-        // during resize causes shellIntegrationActive to never activate, leaving
-        // the terminal blank on startup.
         for (const event of frame.events) {
           switch (event.type) {
             case "AltScreenEntered":
@@ -165,8 +183,6 @@ export function createTerminalStore(): TerminalStore {
               s.awaitingNonAltReseed = false;
               s.altScreenLines = [];
               s.scrollOffset = 0;
-              // Only drop visible context when fullscreen TUI is active;
-              // inline mode keeps it so history can still render.
               if (config().clearHistoryForTuis) {
                 s.visibleLinesByGlobal = {};
               }
@@ -175,16 +191,12 @@ export function createTerminalStore(): TerminalStore {
               s.altScreen = false;
               s.altScreenLines = [];
               s.scrollOffset = 0;
-              // Preserve visible context in inline mode until reseed replaces it
               if (config().clearHistoryForTuis) {
                 s.visibleLinesByGlobal = {};
               }
               s.awaitingNonAltReseed = true;
               s.fallbackLines = [];
-              // Track the viewport origin so finalizeActiveBlock can capture
-              // farewell text that starts before the original outputStart.
               s.lastAltExitVisibleBase = frame.visible_base_global;
-              // If activeBlock already exists, reset outputStart directly.
               if (s.activeBlock) {
                 s.activeBlock.outputStart = frame.visible_base_global;
               }
@@ -211,7 +223,6 @@ export function createTerminalStore(): TerminalStore {
               s.cursorKeysApplication = event.cursor_keys_application;
               break;
             case "ScrollbackCleared":
-              // CSI 3J: clear scrollback history
               s.scrollbackLines = [];
               break;
             case "InlineImage": {
@@ -260,21 +271,11 @@ export function createTerminalStore(): TerminalStore {
               break;
             }
             case "TmuxRequested":
-              // Handled by App.tsx (listens via onTmuxEvent after tmux_start)
               break;
             default:
-              // BlockCompleted is ALWAYS deferred to after line processing
-              // so finalizeActiveBlock sees the latest visibleLinesByGlobal
-              // (e.g. farewell text that arrived in the same frame).
-              // Other block events (BlockStarted, BlockCommand) are processed
-              // immediately when possible so activeBlock is set promptly —
-              // AltScreenExited needs it to exist for outputStart resets.
               if (event.type === "BlockCompleted" || s.altScreen || s.awaitingNonAltReseed) {
                 queuedBlockEvents.push(event);
               } else {
-                // Flush queued events, but KEEP any BlockCompleted events
-                // in the queue — they must always run after line processing
-                // so finalizeActiveBlock sees updated visibleLinesByGlobal.
                 if (queuedBlockEvents.length > 0) {
                   const kept: typeof queuedBlockEvents = [];
                   const flushed = queuedBlockEvents.splice(0, queuedBlockEvents.length);
@@ -282,18 +283,17 @@ export function createTerminalStore(): TerminalStore {
                     if (q.type === "BlockCompleted") {
                       kept.push(q);
                     } else {
-                      processBlockEvent(s, q, config().terminalStyle);
+                      processBlockEvent(s, q, config().terminalStyle, snapshotLimit);
                     }
                   }
                   if (kept.length > 0) queuedBlockEvents.push(...kept);
                 }
-                processBlockEvent(s, event, config().terminalStyle);
+                processBlockEvent(s, event, config().terminalStyle, snapshotLimit);
               }
               break;
           }
         }
 
-        // --- Epoch/seq gates for renderable content only ---
         const frameResizeEpoch = Math.max(0, frame.resize_epoch ?? 0);
         if (frameResizeEpoch < s.currentResizeEpoch) {
           if (frameDebug) {
@@ -326,15 +326,11 @@ export function createTerminalStore(): TerminalStore {
         s.rows = frameRows;
         s.cols = frameCols;
 
-        // During inline TUI mode, the backend sends visible_base_global=0
-        // for alt-screen frames. Don't overwrite the real base or history
-        // lookups will break. Keep the last non-alt value instead.
         const isInlineTui = s.altScreen && !config().clearHistoryForTuis;
         if (!isInlineTui) {
           s.visibleBaseGlobal = frame.visible_base_global;
         }
 
-        // Snapshot non-alt anchors so inline history can render correctly
         if (!s.altScreen) {
           s.lastNonAltVisibleBaseGlobal = frame.visible_base_global;
           s.lastNonAltCursorRow = frame.cursor.row;
@@ -348,16 +344,16 @@ export function createTerminalStore(): TerminalStore {
           for (let i = 0; i < frame.scrolled_lines.length; i++) {
             const line = frame.scrolled_lines[i];
             const global = startGlobal + i;
-            s.scrollbackLines[global] = {
+            s.scrollbackLines.push({
               index: global,
               spans: line.spans,
-            };
+            });
           }
+          s.scrollbackLines = pruneScrollbackLines(s.scrollbackLines, frame.visible_base_global, scrollbackLimit);
         }
 
         if (s.altScreen) {
           if (viewportChanged) {
-            // Alt-screen TUIs repaint on SIGWINCH; don't merge stale viewport content.
             s.altScreenLines = frame.lines.map((line) => ({
               index: line.index,
               spans: line.spans,
@@ -370,26 +366,20 @@ export function createTerminalStore(): TerminalStore {
           applyLinesToBuffer(s.fallbackLines, frame.lines);
           trimBufferToRows(s.fallbackLines, frameRows);
 
-          // Keep a bounded visible map keyed by global row.
-          // Preserve unchanged lines in the current viewport range and apply
-          // incoming dirty lines at their global row IDs.
           const visibleStart = frame.visible_base_global;
           const visibleEndExclusive = visibleStart + frameRows;
           const nextVisible: Record<number, RenderedLine> = {};
 
-          // When keeping history for TUIs, preserve all existing history keys
-          // that are outside the current viewport. This prevents post-TUI
-          // grid erases (CSI 2J) from wiping history line data that snapshots
-          // and fallback rendering depend on.
           const preserveHistory = !config().clearHistoryForTuis;
+          // Bound how far back we preserve visible history keys
+          const minHistoryGlobal = Math.max(0, visibleStart - scrollbackLimit);
 
           for (const key of Object.keys(s.visibleLinesByGlobal)) {
             const global = Number(key);
             if (!Number.isFinite(global)) continue;
             if (global >= visibleStart && global < visibleEndExclusive) {
               nextVisible[global] = s.visibleLinesByGlobal[global];
-            } else if (preserveHistory && global < visibleStart) {
-              // Keep history keys below the viewport so they survive grid erases
+            } else if (preserveHistory && global >= minHistoryGlobal && global < visibleStart) {
               nextVisible[global] = s.visibleLinesByGlobal[global];
             }
           }
@@ -398,8 +388,6 @@ export function createTerminalStore(): TerminalStore {
             const global = frame.visible_base_global + line.index;
             const incoming: RenderedLine = { index: global, spans: line.spans };
 
-            // When preserving history, don't overwrite existing non-empty
-            // history lines with blank lines from a post-TUI grid erase.
             if (preserveHistory && global < visibleStart) {
               const existing = nextVisible[global];
               const incomingEmpty = incoming.spans.length === 0 ||
@@ -417,13 +405,10 @@ export function createTerminalStore(): TerminalStore {
           }
         }
 
-        // Flush queued block events AFTER line processing so that
-        // finalizeActiveBlock/processBlockEvent always sees the latest
-        // visibleLinesByGlobal (including farewell text from this frame).
         if (!s.altScreen && !s.awaitingNonAltReseed && queuedBlockEvents.length > 0) {
           const queued = queuedBlockEvents.splice(0, queuedBlockEvents.length);
           for (const q of queued) {
-            processBlockEvent(s, q, config().terminalStyle);
+            processBlockEvent(s, q, config().terminalStyle, snapshotLimit);
           }
         }
 
@@ -435,7 +420,6 @@ export function createTerminalStore(): TerminalStore {
       }),
     );
 
-    // Check output triggers (outside produce to avoid side effects in store updates)
     for (const line of frame.lines) {
       const text = line.spans.map((s: { text: string }) => s.text).join("");
       if (text.trim()) {
@@ -499,7 +483,7 @@ export function createTerminalStore(): TerminalStore {
   function scrollUp(lines: number) {
     setState(
       produce((s) => {
-        const maxScroll = Math.max(0, s.scrollbackLines.length);
+        const maxScroll = getMaxScrollOffset(s);
         s.scrollOffset = Math.min(s.scrollOffset + lines, maxScroll);
       }),
     );
@@ -521,23 +505,37 @@ export function createTerminalStore(): TerminalStore {
 }
 
 function applyLinesToBuffer(buffer: RenderedLine[], incoming: RenderedLine[]) {
+  if (incoming.length === 0) return;
+
+  const byIndex = new Map<number, number>();
+  for (let i = 0; i < buffer.length; i++) {
+    byIndex.set(buffer[i].index, i);
+  }
+
+  const toAppend: RenderedLine[] = [];
   for (const line of incoming) {
-    const idx = buffer.findIndex((l) => l.index === line.index);
-    if (idx >= 0) {
-      buffer[idx] = line;
+    const existing = byIndex.get(line.index);
+    if (existing !== undefined) {
+      buffer[existing] = line;
     } else {
-      buffer.push(line);
+      toAppend.push(line);
     }
   }
-  buffer.sort((a, b) => a.index - b.index);
+
+  if (toAppend.length > 0) {
+    buffer.push(...toAppend);
+    buffer.sort((a, b) => a.index - b.index);
+  }
 }
 
 function trimBufferToRows(buffer: RenderedLine[], maxRows: number) {
-  for (let i = buffer.length - 1; i >= 0; i--) {
-    if (buffer[i].index >= maxRows) {
-      buffer.splice(i, 1);
+  let writeIdx = 0;
+  for (let i = 0; i < buffer.length; i++) {
+    if (buffer[i].index < maxRows) {
+      buffer[writeIdx++] = buffer[i];
     }
   }
+  buffer.length = writeIdx;
 }
 
 function hasAllVisibleRows(buffer: RenderedLine[], rows: number): boolean {
@@ -554,6 +552,7 @@ function processBlockEvent(
   state: TerminalStoreState,
   event: TerminalEvent,
   terminalStyle: "chat" | "traditional",
+  snapshotLimit: number,
 ) {
   switch (event.type) {
     case "BlockStarted": {
@@ -586,7 +585,7 @@ function processBlockEvent(
     }
     case "BlockCompleted": {
       state.shellIntegrationActive = true;
-      finalizeActiveBlock(state, event);
+      finalizeActiveBlock(state, event, snapshotLimit);
       break;
     }
     default:
@@ -594,7 +593,11 @@ function processBlockEvent(
   }
 }
 
-function finalizeActiveBlock(state: TerminalStoreState, event: TerminalEvent) {
+function finalizeActiveBlock(
+  state: TerminalStoreState,
+  event: TerminalEvent,
+  snapshotLimit: number,
+) {
   if (event.type !== "BlockCompleted") return;
   const active = state.activeBlock;
   if (!active || active.id !== event.id) return;
@@ -606,9 +609,6 @@ function finalizeActiveBlock(state: TerminalStoreState, event: TerminalEvent) {
 
   const endExclusive = event.global_row + 1;
   let start = active.outputStart ?? endExclusive;
-  // If the command used alt screen, farewell text may start before
-  // the original outputStart (e.g. after CSI 2J + CSI H moves cursor
-  // to row 0). Use the viewport origin from alt screen exit.
   if (state.lastAltExitVisibleBase !== null) {
     start = Math.min(start, state.lastAltExitVisibleBase);
     state.lastAltExitVisibleBase = null;
@@ -634,18 +634,26 @@ function finalizeActiveBlock(state: TerminalStoreState, event: TerminalEvent) {
       failed,
     });
 
-    // Notify for long-running commands when window is not focused
+    if (state.snapshots.length > snapshotLimit) {
+      state.snapshots = state.snapshots.slice(-snapshotLimit);
+    }
+
     if (typeof document !== "undefined" && document.hidden) {
       const elapsed = Date.now() - (active.startTime ?? Date.now());
       if (elapsed > 5000 && active.command) {
-        try {
-          const status = event.exit_code === 0 ? "completed" : "failed";
-          new Notification(`Command ${status}`, {
-            body: active.command,
-            silent: true,
-          });
-        } catch {
-          // Notifications may not be available
+        if (typeof Notification !== "undefined" && Notification.permission === "default") {
+          Notification.requestPermission().catch(() => {});
+        }
+        if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+          try {
+            const status = event.exit_code === 0 ? "completed" : "failed";
+            new Notification(`Command ${status}`, {
+              body: active.command,
+              silent: true,
+            });
+          } catch {
+            // Notifications may not be available
+          }
         }
       }
     }

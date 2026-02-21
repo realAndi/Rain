@@ -19,6 +19,19 @@ export function trimTrailingEmpty(lines: RenderedLine[]): RenderedLine[] {
   return lines;
 }
 
+function bsearchScrollback(lines: RenderedLine[], targetIndex: number): RenderedLine | null {
+  let lo = 0;
+  let hi = lines.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const midIdx = lines[mid].index;
+    if (midIdx === targetIndex) return lines[mid];
+    if (midIdx < targetIndex) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return null;
+}
+
 export function collectLinesForRange(
   scrollbackLines: RenderedLine[],
   visibleLinesByGlobal: Record<number, RenderedLine>,
@@ -35,7 +48,7 @@ export function collectLinesForRange(
     let line: RenderedLine | null = null;
 
     if (global < visibleBaseGlobal) {
-      line = scrollbackLines[global] ?? null;
+      line = bsearchScrollback(scrollbackLines, global);
     } else {
       line = visibleLinesByGlobal[global] ?? null;
     }
