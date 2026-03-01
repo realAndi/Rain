@@ -511,11 +511,20 @@
   word-break: break-all;
   line-height: inherit;
   cursor: text;
+  position: relative;
 }
 
 .traditional-inline-buffer {
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.traditional-caret-anchor {
+  display: inline-block;
+  width: 0;
+  height: 1lh;
+  vertical-align: top;
+  pointer-events: none;
 }
 
 /* Traditional welcome: centered at bottom, no title/subtitle */

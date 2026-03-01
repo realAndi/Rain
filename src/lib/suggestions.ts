@@ -113,6 +113,137 @@ function fuzzyMatch(text: string, query: string): { match: boolean; score: numbe
   return { match: true, score: 0.3 + 0.3 * coverage + 0.1 * bonusNorm };
 }
 
+type QuoteChar = "'" | "\"";
+
+interface ParsedShellArg {
+  arg: string;
+  inQuotedContext: boolean;
+  leadingQuote: QuoteChar | null;
+}
+
+function parseLastArgShellAware(input: string): ParsedShellArg {
+  let arg = "";
+  let tokenActive = false;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let escapeNext = false;
+
+  const resetToken = () => {
+    arg = "";
+    tokenActive = false;
+  };
+
+  for (const ch of input) {
+    if (escapeNext) {
+      arg += ch;
+      tokenActive = true;
+      escapeNext = false;
+      continue;
+    }
+
+    if (ch === "\\" && !inSingleQuote) {
+      tokenActive = true;
+      escapeNext = true;
+      continue;
+    }
+
+    if (ch === "'" && !inDoubleQuote) {
+      if (!tokenActive) tokenActive = true;
+      inSingleQuote = !inSingleQuote;
+      continue;
+    }
+
+    if (ch === "\"" && !inSingleQuote) {
+      if (!tokenActive) tokenActive = true;
+      inDoubleQuote = !inDoubleQuote;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote && /\s/.test(ch)) {
+      resetToken();
+      continue;
+    }
+
+    tokenActive = true;
+    arg += ch;
+  }
+
+  return {
+    arg,
+    inQuotedContext: inSingleQuote || inDoubleQuote,
+    leadingQuote: inSingleQuote ? "'" : (inDoubleQuote ? "\"" : null),
+  };
+}
+
+function isPathSuggestionSyntaxSafe(pathLike: string, inQuotedContext: boolean): boolean {
+  if (inQuotedContext) return true;
+  return !/\s/.test(pathLike);
+}
+
+function quotePrefix(parsed: ParsedShellArg): string {
+  if (!parsed.inQuotedContext || !parsed.leadingQuote) return "";
+  return parsed.leadingQuote;
+}
+
+function shellSplit(input: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let escapeNext = false;
+
+  const pushCurrent = () => {
+    if (!current) return;
+    args.push(current);
+    current = "";
+  };
+
+  for (const ch of input) {
+    if (escapeNext) {
+      current += ch;
+      escapeNext = false;
+      continue;
+    }
+
+    if (ch === "\\" && !inSingleQuote) {
+      escapeNext = true;
+      continue;
+    }
+
+    if (ch === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      continue;
+    }
+
+    if (ch === "\"" && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote && /\s/.test(ch)) {
+      pushCurrent();
+      continue;
+    }
+
+    current += ch;
+  }
+
+  pushCurrent();
+  return args;
+}
+
+function isSuggestionSyntaxSafeForPrefix(prefix: string, suggestion: string): boolean {
+  if (!suggestion.startsWith(prefix)) return true;
+  if (!prefix.startsWith("cd ") || !suggestion.startsWith("cd ")) return true;
+
+  const parsedPrefix = parseLastArgShellAware(prefix.slice(3));
+  if (parsedPrefix.inQuotedContext) return true;
+  if (parsedPrefix.arg.startsWith("-")) return true;
+
+  // In unquoted cd context, multiple parsed args indicate an unquoted space path.
+  return shellSplit(suggestion.slice(3)).length <= 1;
+}
+
 // --- HistoryProvider (improved with fuzzy, decay, subcommand, per-dir) ---
 
 export class HistoryProvider implements SuggestionProvider {
@@ -244,15 +375,18 @@ export class RecentOutputProvider implements SuggestionProvider {
   suggest(ctx: SuggestionContext): SuggestionCandidate[] {
     if (!ctx.prefix.startsWith("cd ")) return [];
 
-    const arg = ctx.prefix.slice(3);
+    const parsed = parseLastArgShellAware(ctx.prefix.slice(3));
+    const arg = parsed.arg;
+    const argQuote = quotePrefix(parsed);
     const names = this.extractNamesFromRecentLs(ctx.cwd);
     if (names.length === 0) return [];
 
     const candidates: SuggestionCandidate[] = [];
     for (const name of names) {
       if (!name.startsWith(arg) || name === arg) continue;
+      if (!isPathSuggestionSyntaxSafe(name, parsed.inQuotedContext)) continue;
       candidates.push({
-        text: `cd ${name}`,
+        text: `cd ${argQuote}${name}`,
         score: 0.8,
         source: this.name,
       });
@@ -454,8 +588,12 @@ export class ContextualOutputProvider implements SuggestionProvider {
       const triggerPrefix = pattern.triggerPrefixes.find((tp) => ctx.prefix.startsWith(tp));
       if (!triggerPrefix) continue;
 
-      const arg = ctx.prefix.slice(triggerPrefix.length);
-      const needsFsValidation = fsNames && FILE_PATH_PREFIXES.has(triggerPrefix);
+      const rawArg = ctx.prefix.slice(triggerPrefix.length);
+      const isFilePathPrefix = FILE_PATH_PREFIXES.has(triggerPrefix);
+      const parsedArg = isFilePathPrefix ? parseLastArgShellAware(rawArg) : null;
+      const arg = parsedArg ? parsedArg.arg : rawArg;
+      const argQuote = parsedArg ? quotePrefix(parsedArg) : "";
+      const needsFsValidation = Boolean(fsNames) && isFilePathPrefix;
 
       for (let i = snapshots.length - 1; i >= 0; i--) {
         const snap = snapshots[i];
@@ -468,8 +606,9 @@ export class ContextualOutputProvider implements SuggestionProvider {
           if (!name.startsWith(arg) || name === arg) continue;
           // If we have filesystem data for this CWD, verify the name actually exists
           if (needsFsValidation && !fsNames!.has(name)) continue;
+          if (parsedArg && !isPathSuggestionSyntaxSafe(name, parsedArg.inQuotedContext)) continue;
           candidates.push({
-            text: `${triggerPrefix}${name}`,
+            text: `${triggerPrefix}${argQuote}${name}`,
             score: 0.85,
             source: this.name,
           });
@@ -521,7 +660,7 @@ export class FilesystemProvider implements SuggestionProvider {
     const cmdArg = this.parseCommandArg(ctx.prefix);
     if (!cmdArg) return [];
 
-    const { command, arg } = cmdArg;
+    const { command, arg, inQuotedContext, argQuote } = cmdArg;
     const dirOnly = DIR_ONLY_COMMANDS.has(command);
 
     // Derive the filename filter from the arg (after the last /)
@@ -539,8 +678,9 @@ export class FilesystemProvider implements SuggestionProvider {
       if (!entry.name.startsWith(filter) || entry.name === filter) continue;
 
       const completedArg = argDir + entry.name + (entry.isDir ? "/" : "");
+      if (!isPathSuggestionSyntaxSafe(completedArg, inQuotedContext)) continue;
       candidates.push({
-        text: `${command} ${completedArg}`,
+        text: `${command} ${argQuote}${completedArg}`,
         score: entry.isDir ? 0.78 : 0.72,
         source: this.name,
       });
@@ -549,13 +689,18 @@ export class FilesystemProvider implements SuggestionProvider {
     return candidates;
   }
 
-  parseCommandArg(prefix: string): { command: string; arg: string } | null {
+  parseCommandArg(prefix: string): { command: string; arg: string; inQuotedContext: boolean; argQuote: string } | null {
     for (const cmd of FILE_ARG_COMMANDS) {
       if (prefix.startsWith(cmd + " ")) {
         const rest = prefix.slice(cmd.length + 1);
         // Only complete the last argument (simplification)
-        const parts = rest.split(/\s+/);
-        return { command: cmd, arg: parts[parts.length - 1] };
+        const parsed = parseLastArgShellAware(rest);
+        return {
+          command: cmd,
+          arg: parsed.arg,
+          inQuotedContext: parsed.inQuotedContext,
+          argQuote: quotePrefix(parsed),
+        };
       }
     }
     return null;
@@ -573,8 +718,8 @@ export class FilesystemProvider implements SuggestionProvider {
     for (const cmd of FILE_ARG_COMMANDS) {
       if (prefix.startsWith(cmd + " ")) {
         const rest = prefix.slice(cmd.length + 1);
-        const parts = rest.split(/\s+/);
-        const arg = parts[parts.length - 1];
+        const parsed = parseLastArgShellAware(rest);
+        const arg = parsed.arg;
         const lastSlash = arg.lastIndexOf("/");
         const dirPart = lastSlash >= 0 ? arg.slice(0, lastSlash + 1) : "";
 
@@ -680,7 +825,7 @@ export interface SnoopCacheEntry {
   result: SnoopResult;
   dir: string;
   runtime: string;
-  /** The command prefix portion before the path argument (e.g. "python " or "go run ") */
+  /** The command prefix portion before the path argument (e.g. "python " or "python \"") */
   cmdPrefix: string;
   /** The directory portion of the arg as typed by the user (e.g. "src/" or "/abs/path/") */
   argDir: string;
@@ -708,7 +853,9 @@ export class RuntimeSnoopProvider implements SuggestionProvider {
     // Entry points: highest priority
     for (const ep of result.entryPoints) {
       if (!ep.startsWith(argAfterDir) || ep === argAfterDir) continue;
-      const full = `${cmdPrefix}${argDir}${ep}`;
+      const completedArg = `${argDir}${ep}`;
+      if (!isPathSuggestionSyntaxSafe(completedArg, parsed.inQuotedContext)) continue;
+      const full = `${cmdPrefix}${completedArg}`;
       if (seen.has(full)) continue;
       seen.add(full);
       candidates.push({ text: full, score: 0.90, source: this.name });
@@ -728,7 +875,9 @@ export class RuntimeSnoopProvider implements SuggestionProvider {
     // Filtered files: lower priority but still relevant
     for (const file of result.files) {
       if (!file.startsWith(argAfterDir) || file === argAfterDir) continue;
-      const full = `${cmdPrefix}${argDir}${file}`;
+      const completedArg = `${argDir}${file}`;
+      if (!isPathSuggestionSyntaxSafe(completedArg, parsed.inQuotedContext)) continue;
+      const full = `${cmdPrefix}${completedArg}`;
       if (seen.has(full)) continue;
       seen.add(full);
       candidates.push({ text: full, score: 0.75, source: this.name });
@@ -740,17 +889,17 @@ export class RuntimeSnoopProvider implements SuggestionProvider {
   static directoryToSnoop(
     prefix: string,
     cwd: string,
-  ): { runtime: string; dir: string; cmdPrefix: string; argDir: string } | null {
+  ): { runtime: string; dir: string; cmdPrefix: string; argDir: string; inQuotedContext: boolean } | null {
     for (const cmd of RUNTIME_PREFIXES) {
       const withSpace = cmd + " ";
       if (!prefix.startsWith(withSpace)) continue;
 
       const rest = prefix.slice(withSpace.length);
+      const parsed = parseLastArgShellAware(rest);
+      const arg = parsed.arg;
       // Need at least a directory separator to know we're navigating into a path
-      if (!rest.includes("/")) return null;
+      if (!arg.includes("/")) return null;
 
-      const parts = rest.split(/\s+/);
-      const arg = parts[parts.length - 1];
       const lastSlash = arg.lastIndexOf("/");
       if (lastSlash < 0) return null;
 
@@ -766,8 +915,9 @@ export class RuntimeSnoopProvider implements SuggestionProvider {
       return {
         runtime: RUNTIME_COMMANDS[cmd],
         dir: resolvedDir,
-        cmdPrefix: withSpace,
+        cmdPrefix: withSpace + quotePrefix(parsed),
         argDir: dirPart,
+        inQuotedContext: parsed.inQuotedContext,
       };
     }
     return null;
@@ -798,11 +948,14 @@ export class SuggestionEngine {
       all.push(...candidates);
     }
 
-    if (all.length === 0) return [];
+    const syntaxSafe = all.filter((candidate) =>
+      isSuggestionSyntaxSafeForPrefix(ctx.prefix, candidate.text),
+    );
+    if (syntaxSafe.length === 0) return [];
 
     // Deduplicate by text, keeping highest score
     const deduped = new Map<string, SuggestionCandidate>();
-    for (const c of all) {
+    for (const c of syntaxSafe) {
       const existing = deduped.get(c.text);
       if (!existing || c.score > existing.score) {
         deduped.set(c.text, c);

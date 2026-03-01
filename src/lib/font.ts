@@ -86,39 +86,7 @@ export function measureFontMetrics(
 
   const lineHeight = Math.ceil(fontSize * lineHeightMultiplier);
 
-  // Create a hidden probe element with the exact same styles as the terminal.
-  // white-space: pre matches .term-span / .term-line so layout is identical.
-  const probe = document.createElement("span");
-  probe.style.cssText = [
-    `font-family: "${fontFamily}", "Rain Symbols Fallback", monospace`,
-    `font-size: ${fontSize}px`,
-    `line-height: ${lineHeight}px`,
-    `letter-spacing: ${letterSpacing}px`,
-    `font-variant-ligatures: contextual`,
-    `font-kerning: none`,
-    `text-rendering: optimizeSpeed`,
-    `-webkit-font-smoothing: antialiased`,
-    `white-space: pre`,
-    `position: absolute`,
-    `visibility: hidden`,
-    `top: -9999px`,
-    `left: -9999px`,
-  ].join(";");
-
-  // Use repeated characters and divide to smooth out sub-pixel rounding.
-  const testStr = "X".repeat(10);
-  probe.textContent = testStr;
-  document.body.appendChild(probe);
-
-  const charWidth = probe.getBoundingClientRect().width / testStr.length;
-
-  // Measure height from the same probe for consistency
-  const probeHeight = probe.getBoundingClientRect().height;
-
-  document.body.removeChild(probe);
-
-  // For baseline/ascent we still use canvas since the DOM doesn't expose it.
-  // Vertical metrics are less sensitive to canvas vs DOM differences.
+  // 1. Measure vertical metrics with canvas (uses original font).
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d")!;
   ctx.font = `${fontSize}px "${fontFamily}", monospace`;
@@ -127,7 +95,43 @@ export function measureFontMetrics(
   const descent = tm.fontBoundingBoxDescent ?? tm.actualBoundingBoxDescent ?? fontSize * 0.2;
   const charHeight = ascent + descent;
 
+  // 2. Install @font-face override so the probe below uses the same font
+  //    the terminal will actually render with.
   const adjustedFontFamily = installMetricOverride(fontFamily, ascent, descent);
+
+  // 3. Measure charWidth with a DOM probe styled identically to the terminal
+  //    container. Uses the adjusted font-family and every CSS property from
+  //    .terminal-container that can affect character advance width.
+  const probe = document.createElement("span");
+  probe.style.cssText = [
+    `font-family: "${adjustedFontFamily}", "${fontFamily}", "Rain Symbols Fallback", monospace`,
+    `font-size: ${fontSize}px`,
+    `line-height: ${lineHeight}px`,
+    `letter-spacing: ${letterSpacing}px`,
+    `font-variant-ligatures: contextual`,
+    `font-variant-numeric: tabular-nums`,
+    `font-kerning: none`,
+    `text-rendering: optimizeSpeed`,
+    `-webkit-font-smoothing: antialiased`,
+    `-moz-osx-font-smoothing: grayscale`,
+    `-webkit-text-size-adjust: 100%`,
+    `text-size-adjust: 100%`,
+    `word-spacing: 0px`,
+    `white-space: pre`,
+    `position: absolute`,
+    `visibility: hidden`,
+    `top: -9999px`,
+    `left: -9999px`,
+  ].join(";");
+
+  const testStr = "X".repeat(10);
+  probe.textContent = testStr;
+  document.body.appendChild(probe);
+
+  const charWidth = probe.getBoundingClientRect().width / testStr.length;
+  const probeHeight = probe.getBoundingClientRect().height;
+
+  document.body.removeChild(probe);
 
   const result: FontMetrics = {
     charWidth,

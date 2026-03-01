@@ -1,5 +1,6 @@
 import type { RenderedLine } from "../../lib/types";
 import { getHostname as fetchHostname } from "../../lib/ipc";
+import { createSignal } from "solid-js";
 
 // Build a complete grid of `rows` lines from a sparse buffer, filling gaps with empty lines
 export function buildFullGrid(buffer: RenderedLine[], rows: number): RenderedLine[] {
@@ -36,14 +37,28 @@ export function extractUsername(cwd: string): string {
   return "user";
 }
 
-// Real hostname fetched from the OS via Tauri IPC
-let _cachedHostname = "localhost";
+// Real hostname fetched from the OS via Tauri IPC.
+// Use signals so prompt rendering can react when hostname resolves.
+const [hostname, setHostname] = createSignal("localhost");
+const [hostnameReady, setHostnameReady] = createSignal(false);
 
 // Fetch hostname at module load time
-fetchHostname().then((h) => { _cachedHostname = h; }).catch(() => {});
+fetchHostname()
+  .then((h) => {
+    setHostname((h || "").trim() || "localhost");
+    setHostnameReady(true);
+  })
+  .catch(() => {
+    setHostname("localhost");
+    setHostnameReady(true);
+  });
 
 export function getHostname(): string {
-  return _cachedHostname;
+  return hostname();
+}
+
+export function isHostnameReady(): boolean {
+  return hostnameReady();
 }
 
 // For default prompt: show just the last directory name, or ~ for home

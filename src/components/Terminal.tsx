@@ -33,7 +33,7 @@ import { TerminalLine } from "./TerminalLine";
 import { Cursor } from "./Cursor";
 import { IconFolder, IconCopy, IconCommand, IconArrowDown } from "./icons";
 import { matchesKeybinding } from "../lib/keybindings";
-import { buildFullGrid, formatCwdSimplified, extractUsername, getHostname, formatCwdDefault } from "./terminal/utils";
+import { buildFullGrid, formatCwdSimplified, extractUsername, getHostname, isHostnameReady, formatCwdDefault } from "./terminal/utils";
 import { CommandBlock } from "./terminal/CommandBlock";
 import { TraditionalBlock } from "./terminal/TraditionalBlock";
 import { WelcomeState } from "./terminal/WelcomeState";
@@ -47,6 +47,8 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
   let containerRef!: HTMLDivElement;
   let scrollRef!: HTMLDivElement;
   let srAnnouncerRef: HTMLDivElement | undefined;
+  let traditionalInputLineRef: HTMLDivElement | undefined;
+  let traditionalCaretAnchorRef: HTMLSpanElement | undefined;
   const { config } = useConfig();
   const { theme } = useTheme();
   const inputBuffer = createInputBuffer();
@@ -195,6 +197,8 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
   const [isScrolledUp, setIsScrolledUp] = createSignal(false);
   const [containerHeight, setContainerHeight] = createSignal(600);
   const [waitingForTab, setWaitingForTab] = createSignal(false);
+  const [traditionalCursorPx, setTraditionalCursorPx] = createSignal<{ left: number; top: number } | null>(null);
+  const [traditionalCursorMeasureEpoch, setTraditionalCursorMeasureEpoch] = createSignal(0);
 
   // Selection state for text selection
   const [selection, setSelection] = createSignal<SelectionState>(createSelectionState());
@@ -959,6 +963,16 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     });
   });
 
+  createEffect(() => {
+    const _ = bufferCursor().row;
+    requestAnimationFrame(() => {
+      const inputContent = containerRef?.querySelector(".input-content");
+      if (inputContent) {
+        inputContent.scrollTop = inputContent.scrollHeight;
+      }
+    });
+  });
+
   // TUI render mode helpers (must be above memos that reference them)
   const tmuxForcesTraditional = () => config().terminalStyle === "chat" && (props.store.state.tmuxActive || props.store.state.tmuxPaneId != null);
   const isTraditional = () => config().terminalStyle === "traditional" || tmuxForcesTraditional();
@@ -1470,6 +1484,10 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     // Normal mode: local buffer editing
     const sid = props.store.state.sessionId;
     if (!sid) return;
+    if (!localInputReady()) {
+      e.preventDefault();
+      return;
+    }
 
     // Reset cursor blink on any input activity
     resetBlink();
@@ -1686,6 +1704,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
       }
     } else {
       // Normal mode: insert into local buffer
+      if (!localInputReady()) return;
       inputBuffer.insert(text);
     }
   };
@@ -1713,7 +1732,17 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     containerRef?.focus();
   };
 
+  const localInputReady = () => {
+    const style = promptStyle();
+    if (style === "blank") return true;
+    if (!props.store.state.connected) return false;
+    if (!props.store.state.cwd) return false;
+    if (style === "default" && !isHostnameReady()) return false;
+    return true;
+  };
+
   const promptText = () => {
+    if (!localInputReady()) return null;
     const cwd = props.store.state.cwd;
     const style = promptStyle();
     if (style === "blank") return null;
@@ -1738,12 +1767,16 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
 
   // Wrap buffer text into lines at terminal column width
   const bufferLines = createMemo(() => {
-    const text = inputBuffer.state().text;
+    const s = inputBuffer.state();
+    const text = s.text;
     const cols = termCols();
-    if (text.length <= cols) return [text || "\u200B"];
     const lines: string[] = [];
     for (let i = 0; i < text.length; i += cols) {
       lines.push(text.slice(i, i + cols));
+    }
+    const cursorRow = Math.floor(s.cursorPos / cols);
+    while (lines.length <= cursorRow) {
+      lines.push("\u200B");
     }
     if (lines.length === 0) lines.push("\u200B");
     return lines;
@@ -1763,7 +1796,50 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     };
   });
 
-  // Debounce suggestion computation: wait 500ms of no typing before showing ghost text
+  const traditionalCursorSplit = createMemo(() => {
+    const s = inputBuffer.state();
+    return {
+      before: s.text.slice(0, s.cursorPos),
+      after: s.text.slice(s.cursorPos),
+      empty: s.text.length === 0,
+    };
+  });
+
+  // Traditional mode uses native browser wrapping with prompt + buffer in one flow.
+  // Anchor the cursor to a DOM marker at the exact caret position so it follows
+  // wrapped lines correctly (including first-line prompt width offset).
+  createEffect(() => {
+    const traditionalInputVisible = isTraditional() && !inlineTui() && !props.store.state.activeBlock;
+    const split = traditionalCursorSplit();
+    const tabActive = props.isTabActive ?? true;
+    const _measureEpoch = traditionalCursorMeasureEpoch();
+    const _cols = termCols();
+    const _cursor = bufferCursor();
+    if (!traditionalInputVisible || !tabActive) {
+      setTraditionalCursorPx(null);
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      const lineEl = traditionalInputLineRef;
+      const anchorEl = traditionalCaretAnchorRef;
+      if (!lineEl || !anchorEl) {
+        setTraditionalCursorPx(null);
+        return;
+      }
+      const lineRect = lineEl.getBoundingClientRect();
+      const anchorRect = anchorEl.getBoundingClientRect();
+      setTraditionalCursorPx({
+        left: Math.max(0, anchorRect.left - lineRect.left),
+        top: Math.max(0, anchorRect.top - lineRect.top),
+      });
+    });
+    void _measureEpoch;
+    void split;
+  });
+
+  const SUGGESTION_DEBOUNCE_MS = 230;
+  // Debounce suggestion computation: wait briefly after typing before showing ghost text
   let suggestionTimer: ReturnType<typeof setTimeout> | null = null;
 
   function refreshSuggestionsNow() {
@@ -1798,7 +1874,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
 
     suggestionTimer = setTimeout(() => {
       refreshSuggestionsNow();
-    }, 500);
+    }, SUGGESTION_DEBOUNCE_MS);
   });
 
   onCleanup(() => {
@@ -1940,8 +2016,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
               </For>
               <Cursor
                 cursor={props.store.state.cursor}
-                charWidth={charWidth()}
-                lineHeight={lineHeight()}
+                letterSpacing={config().letterSpacing}
               />
             </div>
           </div>
@@ -2030,8 +2105,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                     </For>
                     <Cursor
                       cursor={fallbackCursor()}
-                      charWidth={charWidth()}
-                      lineHeight={lineHeight()}
+                      letterSpacing={config().letterSpacing}
                     />
                   </div>
                 }>
@@ -2067,10 +2141,14 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
               </Show>
 
               {/* Traditional mode: inline input (hidden while a command/TUI is active) */}
-              <Show when={isTraditional() && !inlineTui() && !props.store.state.activeBlock}>
+              <Show when={isTraditional() && !inlineTui() && !props.store.state.activeBlock && localInputReady()}>
                 <div
                   class="traditional-input-line"
                   aria-label="Terminal input"
+                  ref={(el) => {
+                    traditionalInputLineRef = el;
+                    setTraditionalCursorMeasureEpoch((n) => n + 1);
+                  }}
                   onClick={handleLocalInputClick}
                   onDblClick={handleLocalInputDblClick}
                 >
@@ -2085,27 +2163,48 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                       </>
                     )}
                   </Show>
-                  <span class="traditional-inline-buffer" style={{ position: "relative" }}>
+                  <span
+                    class="traditional-inline-buffer"
+                    style={{ position: "relative" }}
+                  >
                     <For each={selectionRects()}>
                       {(rect) => (
                         <span class="input-selection" style={rect} />
                       )}
                     </For>
-                    {inputBuffer.state().text || "\u200B"}
+                    {(() => {
+                      const split = traditionalCursorSplit();
+                      return (
+                        <>
+                          {split.before}
+                          <span
+                            class="traditional-caret-anchor"
+                            aria-hidden="true"
+                            ref={(el) => {
+                              traditionalCaretAnchorRef = el;
+                              setTraditionalCursorMeasureEpoch((n) => n + 1);
+                            }}
+                          />
+                          {split.after || (split.empty ? "\u200B" : "")}
+                        </>
+                      );
+                    })()}
                     <Show when={ghostText()}>
                       <span class="ghost-suggestion">{ghostText()}</span>
                     </Show>
-                    {(() => {
-                      const _key = blinkKey();
-                      return (
-                        <Cursor
-                          cursor={bufferCursor()}
-                          charWidth={charWidth()}
-                          lineHeight={lineHeight()}
-                        />
-                      );
-                    })()}
                   </span>
+                  {(() => {
+                    const _key = blinkKey();
+                    const pos = traditionalCursorPx();
+                    if (!pos) return null;
+                    return (
+                      <Cursor
+                        cursor={bufferCursor()}
+                        leftPx={pos.left}
+                        topPx={pos.top}
+                      />
+                    );
+                  })()}
                 </div>
 
                 {/* Traditional welcome below the prompt */}
@@ -2134,8 +2233,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   </For>
                   <Cursor
                     cursor={props.store.state.cursor}
-                    charWidth={charWidth()}
-                    lineHeight={lineHeight()}
+                    letterSpacing={config().letterSpacing}
                   />
                 </div>
               </div>
@@ -2167,9 +2265,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                 </For>
                 <Cursor
                   cursor={primaryScreenCursor()}
-                  charWidth={charWidth()}
-                  lineHeight={lineHeight()}
-                  blinking={false}
+                  letterSpacing={config().letterSpacing}
                 />
               </div>
             }>
@@ -2225,7 +2321,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
         </Show>
 
         {/* Chat mode: input area (hidden during inline TUI or when shell integration is off) */}
-        <Show when={!isTraditional() && !props.store.state.activeBlock && !inlineTui() && props.store.state.shellIntegrationActive}>
+        <Show when={!isTraditional() && !props.store.state.activeBlock && !inlineTui() && props.store.state.shellIntegrationActive && localInputReady()}>
         <div class="terminal-active">
           <div class="input-card">
             <Show when={promptText()}>
@@ -2270,8 +2366,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   return (
                     <Cursor
                       cursor={bufferCursor()}
-                      charWidth={charWidth()}
-                      lineHeight={lineHeight()}
+                      letterSpacing={config().letterSpacing}
                     />
                   );
                 })()}
