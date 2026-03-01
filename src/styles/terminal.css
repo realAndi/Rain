@@ -14,6 +14,15 @@
   left: 0;
   right: 0;
   bottom: 0;
+  font-kerning: none;
+  font-variant-numeric: tabular-nums;
+  text-rendering: optimizeSpeed;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  word-spacing: 0px;
+  tab-size: 8;
 }
 
 .terminal-container.terminal-hidden {
@@ -154,10 +163,10 @@
   display: block;
   white-space: pre;
   line-height: inherit;
-  min-height: 1lh;
+  height: 1lh;
   margin: 0;
   padding: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .term-span {
@@ -498,13 +507,15 @@
 /* Traditional inline input (prompt + buffer on one line) */
 .traditional-input-line {
   display: block;
-  white-space: pre;
+  white-space: pre-wrap;
+  word-break: break-all;
   line-height: inherit;
   cursor: text;
 }
 
 .traditional-inline-buffer {
-  white-space: pre;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 /* Traditional welcome: centered at bottom, no title/subtitle */
@@ -771,4 +782,5 @@
 .canvas-terminal {
   image-rendering: pixelated;
   -webkit-font-smoothing: antialiased;
+  max-width: 100%;
 }

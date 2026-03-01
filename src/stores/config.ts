@@ -55,7 +55,7 @@ const LIQUID_TINT_REGEX = /^#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 const defaultConfig: RainConfig = {
   fontFamily: "JetBrains Mono",
   fontSize: 14,
-  lineHeight: 1.2,
+  lineHeight: 1.0,
   windowOpacity: 0.68,
   backgroundBlurStrength: 40,
   macosGlassEngine: "cgs",

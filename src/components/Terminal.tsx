@@ -960,7 +960,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
   });
 
   // TUI render mode helpers (must be above memos that reference them)
-  const tmuxForcesTraditional = () => config().terminalStyle === "chat" && props.store.state.tmuxActive;
+  const tmuxForcesTraditional = () => config().terminalStyle === "chat" && (props.store.state.tmuxActive || props.store.state.tmuxPaneId != null);
   const isTraditional = () => config().terminalStyle === "traditional" || tmuxForcesTraditional();
   const promptStyle = () => config().promptStyle;
   const fullscreenTui = () => props.store.state.altScreen && config().clearHistoryForTuis;
@@ -1068,7 +1068,18 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
   });
 
   const primaryScreenCursor = createMemo(() => {
-    return props.store.state.cursor;
+    const c = props.store.state.cursor;
+    const active = props.store.state.activeBlock;
+    if (!active) return c;
+    const visibleBase = props.store.state.visibleBaseGlobal;
+    const startRow = Math.max(0, (active.outputStart ?? 0) - visibleBase);
+    return { ...c, row: c.row - startRow };
+  });
+
+  const fallbackCursor = createMemo(() => {
+    const c = props.store.state.cursor;
+    const base = props.store.state.visibleBaseGlobal;
+    return { ...c, row: base + c.row };
   });
 
   const isEmpty = createMemo(() => {
@@ -1082,8 +1093,14 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
   const m = () => metrics();
   const lineHeight = () => m()?.lineHeight ?? 20;
   const fontFamily = () => {
-    const f = m()?.fontFamily;
-    return f ? `"${f}", monospace` : "monospace";
+    const met = m();
+    if (!met) return "monospace";
+    const adj = met.adjustedFontFamily;
+    const orig = met.fontFamily;
+    if (adj && adj !== orig) {
+      return `"${adj}", "${orig}", monospace`;
+    }
+    return `"${orig}", monospace`;
   };
   const fontSize = () => m()?.fontSize ?? 14;
   const charWidth = () => m()?.charWidth ?? 8;
@@ -1421,6 +1438,11 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
         clearSelection();
         return;
       }
+      // Fall back to native browser selection (e.g. text selected in command/traditional blocks)
+      const nativeSel = window.getSelection();
+      if (nativeSel && nativeSel.toString().length > 0) {
+        return; // let the browser handle the copy natively
+      }
     }
 
     // Any non-modifier key press resets scroll offset and clears selection
@@ -1431,9 +1453,9 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
       clearSelection();
     }
 
-    // Alt screen or running command: raw PTY mode
-    // (local buffer only active at the prompt, not while a command executes)
-    if (props.store.state.altScreen || props.store.state.activeBlock) {
+    // Alt screen, running command, or no shell integration: raw PTY mode
+    // (local buffer only active at the prompt when shell integration is available)
+    if (props.store.state.altScreen || props.store.state.activeBlock || !props.store.state.shellIntegrationActive) {
       if (e.metaKey && key === "c") {
         const sel = window.getSelection();
         if (sel && sel.toString().length > 0) return;
@@ -1644,8 +1666,8 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
       if (!confirmed) return;
     }
 
-    if (props.store.state.altScreen || props.store.state.activeBlock) {
-      // Alt screen or running command: send paste to PTY
+    if (props.store.state.altScreen || props.store.state.activeBlock || !props.store.state.shellIntegrationActive) {
+      // Alt screen, running command, or no shell integration: send paste to PTY
       const sid = props.store.state.sessionId;
       if (!sid) return;
       const encoder = new TextEncoder();
@@ -1845,6 +1867,10 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
           const lines = getAllDisplayLines();
           selectedText = extractSelectedText(lines, sel.range) || undefined;
         }
+        if (!selectedText) {
+          const nativeSel = window.getSelection()?.toString();
+          if (nativeSel) selectedText = nativeSel;
+        }
         let linkUrl: string | undefined;
         const target = e.target as HTMLElement;
         if (target.classList.contains("term-url")) {
@@ -1990,7 +2016,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
 
               <Show when={!props.store.state.shellIntegrationActive && hasRenderableFallbackContent()}>
                 <Show when={useCanvasViewport()} fallback={
-                  <div class="active-output">
+                  <div class="active-output" style={{ position: "relative" }}>
                     <For each={fallbackOutputLines()}>
                       {(line) => (
                         <TerminalLine
@@ -2002,6 +2028,11 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                         />
                       )}
                     </For>
+                    <Cursor
+                      cursor={fallbackCursor()}
+                      charWidth={charWidth()}
+                      lineHeight={lineHeight()}
+                    />
                   </div>
                 }>
                   <canvas
@@ -2193,8 +2224,8 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
           </button>
         </Show>
 
-        {/* Chat mode: input area (hidden during inline TUI) */}
-        <Show when={!isTraditional() && !props.store.state.activeBlock && !inlineTui()}>
+        {/* Chat mode: input area (hidden during inline TUI or when shell integration is off) */}
+        <Show when={!isTraditional() && !props.store.state.activeBlock && !inlineTui() && props.store.state.shellIntegrationActive}>
         <div class="terminal-active">
           <div class="input-card">
             <Show when={promptText()}>
@@ -2257,16 +2288,12 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
           <ContextMenu
             x={pos().x}
             y={pos().y}
-            hasSelection={selection().active}
+            hasSelection={!!pos().selectedText}
             selectedText={pos().selectedText}
             linkUrl={pos().linkUrl}
             onCopy={() => {
-              const sel = selection();
-              if (sel.active && sel.range) {
-                const lines = getAllDisplayLines();
-                const text = extractSelectedText(lines, sel.range);
-                if (text) navigator.clipboard.writeText(text).catch(console.error);
-              }
+              const text = pos().selectedText;
+              if (text) navigator.clipboard.writeText(text).catch(console.error);
               setContextMenu(null);
             }}
             onPaste={async () => {

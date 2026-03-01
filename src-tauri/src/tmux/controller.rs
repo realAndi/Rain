@@ -231,7 +231,7 @@ impl TmuxController {
     ///
     /// `args` is the raw argument string from the user's tmux command
     /// (e.g. "", "new-session", "attach -t main").
-    pub fn start(app_handle: AppHandle, args: &str) -> Result<Self, String> {
+    pub fn start(app_handle: AppHandle, args: &str, cwd: Option<&str>) -> Result<Self, String> {
         let tmux_path = which_tmux().ok_or_else(|| {
             if cfg!(windows) {
                 "tmux is not available on this system. Install tmux via MSYS2, Git Bash, or Scoop.".to_string()
@@ -261,6 +261,12 @@ impl TmuxController {
         } else {
             for arg in shell_split(trimmed) {
                 cmd.arg(arg);
+            }
+        }
+
+        if let Some(dir) = cwd {
+            if std::path::Path::new(dir).is_dir() {
+                cmd.cwd(dir);
             }
         }
 

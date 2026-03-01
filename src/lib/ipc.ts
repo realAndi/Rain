@@ -71,10 +71,6 @@ export async function getHostname(): Promise<string> {
   return invoke<string>("get_hostname");
 }
 
-export async function setAppIcon(iconName: string): Promise<void> {
-  return invoke("set_app_icon", { iconName });
-}
-
 export async function quitApp(): Promise<void> {
   return invoke("quit_app");
 }
@@ -236,8 +232,8 @@ export type TmuxEvent =
   | { type: "Detached" }
   | { type: "Ended" };
 
-export async function tmuxStart(args?: string): Promise<void> {
-  return invoke("tmux_start", { args });
+export async function tmuxStart(args?: string, cwd?: string): Promise<void> {
+  return invoke("tmux_start", { args, cwd });
 }
 
 export async function tmuxSendKeys(paneId: number, data: number[]): Promise<void> {

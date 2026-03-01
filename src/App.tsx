@@ -766,7 +766,11 @@ const App: Component = () => {
       const tab = tabs.activeTab();
       if (tab) setTmuxOriginTab(tab.id);
 
-      await tmuxStart(args || undefined);
+      const activePaneId = tab ? tabs.getActivePaneId(tab.id) : undefined;
+      const paneStore = activePaneId ? tabs.stores.get(activePaneId) : undefined;
+      const cwd = paneStore?.state.cwd || tab?.cwd || undefined;
+
+      await tmuxStart(args || undefined, cwd);
       devLog("[Rain] tmux control mode started");
     } catch (err) {
       const msg = String(err ?? "");
@@ -1704,8 +1708,30 @@ const App: Component = () => {
                       }
                     }}
                     onOpenSettings={openSettings}
-                    onSplitRight={(paneId) => splitActivePane(tab.id, paneId, "horizontal")}
-                    onSplitDown={(paneId) => splitActivePane(tab.id, paneId, "vertical")}
+                    onSplitRight={(paneId) => {
+                      const store = tabs.stores.get(paneId);
+                      const tmuxPid = store?.state.tmuxPaneId;
+                      if (tmuxPid != null) {
+                        tmuxSelectPane(tmuxPid)
+                          .catch(() => undefined)
+                          .then(() => tmuxSplitPane("horizontal", tmuxPid))
+                          .catch(console.error);
+                      } else {
+                        splitActivePane(tab.id, paneId, "horizontal");
+                      }
+                    }}
+                    onSplitDown={(paneId) => {
+                      const store = tabs.stores.get(paneId);
+                      const tmuxPid = store?.state.tmuxPaneId;
+                      if (tmuxPid != null) {
+                        tmuxSelectPane(tmuxPid)
+                          .catch(() => undefined)
+                          .then(() => tmuxSplitPane("vertical", tmuxPid))
+                          .catch(console.error);
+                      } else {
+                        splitActivePane(tab.id, paneId, "vertical");
+                      }
+                    }}
                   />
                 )}
               </Show>

@@ -162,7 +162,6 @@ pub fn run() {
             ipc::commands::session::request_full_redraw,
             ipc::commands::window::set_window_blur_radius,
             ipc::commands::window::set_window_opacity,
-            ipc::commands::window::set_app_icon,
             ipc::commands::window::get_hostname,
             ipc::commands::window::create_child_window,
             ipc::commands::window::create_drag_ghost,

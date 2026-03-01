@@ -55,7 +55,6 @@ pub use window::{
     get_hostname,
     quit_app,
     register_global_hotkey,
-    set_app_icon,
     set_window_blur_radius,
     set_window_opacity,
     toggle_window_visibility,

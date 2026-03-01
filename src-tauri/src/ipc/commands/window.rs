@@ -140,55 +140,6 @@ pub fn set_window_opacity(webview: WebviewWindow, opacity: f64) -> Result<(), St
     Ok(())
 }
 
-/// Set the app icon at runtime from a bundled resource.
-/// On macOS this changes the dock icon via NSApplication; on other platforms
-/// it updates every window's icon using Tauri's cross-platform API.
-#[tauri::command]
-pub fn set_app_icon(app: AppHandle, icon_name: String) -> Result<(), String> {
-    let filename = match icon_name.as_str() {
-        "default" => "icons/default-icon.png",
-        "simple" => "icons/simple-icon.png",
-        _ => return Err(format!("Unknown icon: {}", icon_name)),
-    };
-
-    let resource_path = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Resource dir error: {}", e))?
-        .join(filename);
-
-    #[cfg(target_os = "macos")]
-    {
-        use objc2::AnyThread;
-        use objc2_app_kit::{NSApplication, NSImage};
-        use objc2_foundation::{MainThreadMarker, NSString};
-
-        unsafe {
-            let mtm = MainThreadMarker::new_unchecked();
-            let ns_path = NSString::from_str(resource_path.to_str().unwrap());
-            let image = NSImage::initByReferencingFile(NSImage::alloc(), &ns_path);
-            NSApplication::sharedApplication(mtm).setApplicationIconImage(image.as_deref());
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let png_data = std::fs::read(&resource_path)
-            .map_err(|e| format!("Failed to read icon '{}': {}", filename, e))?;
-        let icon = tauri::image::Image::from_bytes(&png_data)
-            .map_err(|e| format!("Failed to decode icon '{}': {}", filename, e))?;
-
-        for (_label, window) in app.webview_windows() {
-            if let Err(e) = window.set_icon(icon.clone()) {
-                tracing::warn!("Failed to set icon on window: {}", e);
-            }
-        }
-    }
-
-    tracing::info!("App icon set to '{}'", icon_name);
-    Ok(())
-}
-
 /// Get the system hostname.
 #[tauri::command]
 pub fn get_hostname() -> String {

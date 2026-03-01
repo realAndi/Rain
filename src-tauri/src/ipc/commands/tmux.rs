@@ -8,14 +8,18 @@ pub fn tmux_start(
     app: AppHandle,
     state: State<'_, AppState>,
     args: Option<String>,
+    cwd: Option<String>,
 ) -> Result<(), String> {
     let mut ctrl = state.tmux_controller.lock();
     if ctrl.is_some() {
         return Err("tmux session already active".to_string());
     }
 
-    let controller =
-        crate::tmux::TmuxController::start(app, args.as_deref().unwrap_or(""))?;
+    let controller = crate::tmux::TmuxController::start(
+        app,
+        args.as_deref().unwrap_or(""),
+        cwd.as_deref(),
+    )?;
     *ctrl = Some(controller);
 
     tracing::info!("tmux control mode started");
