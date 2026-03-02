@@ -7,6 +7,7 @@ import { formatCwdSimplified } from "./utils";
 export const CommandBlock: Component<{
   snapshot: CommandSnapshot;
   charWidth: number;
+  letterSpacing: number;
   promptStyle: "default" | "simplified" | "blank";
 }> = (props) => {
   const [copied, setCopied] = createSignal<"command" | "output" | null>(null);
@@ -101,7 +102,7 @@ export const CommandBlock: Component<{
       <Show when={props.snapshot.lines.length > 0}>
         <div class="block-output">
           <For each={props.snapshot.lines}>
-            {(line) => <TerminalLine line={line} charWidth={props.charWidth} />}
+            {(line) => <TerminalLine line={line} charWidth={props.charWidth} letterSpacing={props.letterSpacing} />}
           </For>
         </div>
       </Show>

@@ -6,6 +6,7 @@ import { extractUsername, getHostname, formatCwdDefault, formatCwdSimplified } f
 export const TraditionalBlock: Component<{
   snapshot: CommandSnapshot;
   charWidth: number;
+  letterSpacing: number;
   promptStyle: "default" | "simplified" | "blank";
 }> = (props) => {
   const displayPrompt = () => {
@@ -39,7 +40,7 @@ export const TraditionalBlock: Component<{
       </Show>
       <Show when={props.snapshot.lines.length > 0}>
         <For each={props.snapshot.lines}>
-          {(line) => <TerminalLine line={line} charWidth={props.charWidth} />}
+          {(line) => <TerminalLine line={line} charWidth={props.charWidth} letterSpacing={props.letterSpacing} />}
         </For>
       </Show>
     </div>

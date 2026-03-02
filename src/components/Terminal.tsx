@@ -281,7 +281,13 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     function measure() {
       const met = metrics();
       if (!met) return;
-      const containerWidth = containerRef.clientWidth - scrollPadding;
+      // Account for scrollbar width: offsetWidth includes the scrollbar,
+      // clientWidth excludes it. When the vertical scrollbar is visible on
+      // terminal-scroll, the available content width is reduced.
+      const scrollbarWidth = scrollRef
+        ? Math.max(0, scrollRef.offsetWidth - scrollRef.clientWidth)
+        : 0;
+      const containerWidth = containerRef.clientWidth - scrollPadding - scrollbarWidth;
       const containerHeightPx = containerRef.clientHeight;
       setContainerHeight(containerHeightPx);
 
@@ -350,6 +356,13 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     // Re-measure immediately when this terminal becomes active.
     createEffect(() => {
       if (!props.active) return;
+      requestAnimationFrame(measure);
+    });
+
+    // Re-measure when alt screen changes — the scrollbar state may differ
+    // between normal shell and inline TUI, affecting available content width.
+    createEffect(() => {
+      const _altScreen = props.store.state.altScreen;
       requestAnimationFrame(measure);
     });
 
@@ -2008,15 +2021,26 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   <TerminalLine
                     line={line}
                     charWidth={charWidth()}
+                    letterSpacing={config().letterSpacing}
                     selectionRange={selection().range}
                     searchMatches={props.store.state.searchMatches}
                     searchCurrentIndex={props.store.state.searchCurrentIndex}
+                    cursorCol={
+                      props.store.state.cursor.visible &&
+                      props.store.state.cursor.shape === "block" &&
+                      line.index === props.store.state.cursor.row
+                        ? props.store.state.cursor.col
+                        : undefined
+                    }
                   />
                 )}
               </For>
               <Cursor
                 cursor={props.store.state.cursor}
+                charWidth={charWidth()}
+                lineHeight={lineHeight()}
                 letterSpacing={config().letterSpacing}
+                blinking={config().cursorBlink}
               />
             </div>
           </div>
@@ -2065,6 +2089,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                     <CommandBlock
                       snapshot={snap}
                       charWidth={charWidth()}
+                      letterSpacing={config().letterSpacing}
                       promptStyle={config().promptStyle}
                     />
                   )}
@@ -2078,6 +2103,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                     <TraditionalBlock
                       snapshot={snap}
                       charWidth={charWidth()}
+                      letterSpacing={config().letterSpacing}
                       promptStyle={config().promptStyle}
                     />
                   )}
@@ -2097,15 +2123,26 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                         <TerminalLine
                           line={line}
                           charWidth={charWidth()}
+                          letterSpacing={config().letterSpacing}
                           selectionRange={selection().range}
                           searchMatches={props.store.state.searchMatches}
                           searchCurrentIndex={props.store.state.searchCurrentIndex}
+                          cursorCol={
+                            fallbackCursor().visible &&
+                            fallbackCursor().shape === "block" &&
+                            line.index === fallbackCursor().row
+                              ? fallbackCursor().col
+                              : undefined
+                          }
                         />
                       )}
                     </For>
                     <Cursor
                       cursor={fallbackCursor()}
+                      charWidth={charWidth()}
+                      lineHeight={lineHeight()}
                       letterSpacing={config().letterSpacing}
+                      blinking={config().cursorBlink}
                     />
                   </div>
                 }>
@@ -2125,6 +2162,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   <CommandBlock
                     snapshot={snap()}
                     charWidth={charWidth()}
+                    letterSpacing={config().letterSpacing}
                     promptStyle={config().promptStyle}
                   />
                 )}
@@ -2135,6 +2173,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   <TraditionalBlock
                     snapshot={snap()}
                     charWidth={charWidth()}
+                    letterSpacing={config().letterSpacing}
                     promptStyle={config().promptStyle}
                   />
                 )}
@@ -2202,6 +2241,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                         cursor={bufferCursor()}
                         leftPx={pos.left}
                         topPx={pos.top}
+                        blinking={config().cursorBlink}
                       />
                     );
                   })()}
@@ -2225,15 +2265,26 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                       <TerminalLine
                         line={line}
                         charWidth={charWidth()}
+                        letterSpacing={config().letterSpacing}
                         selectionRange={selection().range}
                         searchMatches={props.store.state.searchMatches}
                         searchCurrentIndex={props.store.state.searchCurrentIndex}
+                        cursorCol={
+                          props.store.state.cursor.visible &&
+                          props.store.state.cursor.shape === "block" &&
+                          line.index === props.store.state.cursor.row
+                            ? props.store.state.cursor.col
+                            : undefined
+                        }
                       />
                     )}
                   </For>
                   <Cursor
                     cursor={props.store.state.cursor}
+                    charWidth={charWidth()}
+                    lineHeight={lineHeight()}
                     letterSpacing={config().letterSpacing}
+                    blinking={config().cursorBlink}
                   />
                 </div>
               </div>
@@ -2257,15 +2308,26 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                     <TerminalLine
                       line={line}
                       charWidth={charWidth()}
+                      letterSpacing={config().letterSpacing}
                       selectionRange={selection().range}
                       searchMatches={props.store.state.searchMatches}
                       searchCurrentIndex={props.store.state.searchCurrentIndex}
+                      cursorCol={
+                        primaryScreenCursor().visible &&
+                        primaryScreenCursor().shape === "block" &&
+                        line.index === primaryScreenCursor().row
+                          ? primaryScreenCursor().col
+                          : undefined
+                      }
                     />
                   )}
                 </For>
                 <Cursor
                   cursor={primaryScreenCursor()}
+                  charWidth={charWidth()}
+                  lineHeight={lineHeight()}
                   letterSpacing={config().letterSpacing}
+                  blinking={config().cursorBlink}
                 />
               </div>
             }>
@@ -2366,7 +2428,10 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   return (
                     <Cursor
                       cursor={bufferCursor()}
+                      charWidth={charWidth()}
+                      lineHeight={lineHeight()}
                       letterSpacing={config().letterSpacing}
+                      blinking={config().cursorBlink}
                     />
                   );
                 })()}

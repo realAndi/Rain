@@ -1,5 +1,5 @@
 import { Component, For, Show, createMemo } from "solid-js";
-import type { RenderedLine, StyledSpan, SerializableColor, SearchMatch } from "../lib/types";
+import type { RenderedLine, StyledSpan, SearchMatch } from "../lib/types";
 import type { SelectionRange } from "../lib/selection";
 import { normalizeRange, isCellSelected } from "../lib/selection";
 import { useTheme, THEME_ANSI_PALETTES } from "../stores/theme";
@@ -11,12 +11,17 @@ const URL_REGEX = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/g;
 export interface TerminalLineProps {
   line: RenderedLine;
   charWidth: number;
+  letterSpacing: number;
   selectionRange?: SelectionRange | null;
   searchMatches?: SearchMatch[];
   searchCurrentIndex?: number;
+  /** Column of block cursor on this line (undefined if cursor not on this line) */
+  cursorCol?: number;
 }
 
 export const TerminalLine: Component<TerminalLineProps> = (props) => {
+  const cellW = () => props.charWidth + props.letterSpacing;
+
   return (
     <div class="term-line" data-row={props.line.index}>
       <For each={props.line.spans}>
@@ -35,9 +40,11 @@ export const TerminalLine: Component<TerminalLineProps> = (props) => {
               span={span}
               row={props.line.index}
               colOffset={colOffset()}
+              cellW={cellW()}
               selectionRange={props.selectionRange}
               searchMatches={props.searchMatches}
               searchCurrentIndex={props.searchCurrentIndex}
+              cursorCol={props.cursorCol}
             />
           );
         }}
@@ -50,9 +57,11 @@ interface SpanElementProps {
   span: StyledSpan;
   row: number;
   colOffset: number;
+  cellW: number;
   selectionRange?: SelectionRange | null;
   searchMatches?: SearchMatch[];
   searchCurrentIndex?: number;
+  cursorCol?: number;
 }
 
 const SpanElement: Component<SpanElementProps> = (props) => {
@@ -60,7 +69,10 @@ const SpanElement: Component<SpanElementProps> = (props) => {
   const ansiPalette = createMemo(() => THEME_ANSI_PALETTES[theme()] ?? THEME_ANSI_PALETTES["dark"]);
 
   const style = () => {
-    const s: Record<string, string> = { opacity: "1" };
+    const s: Record<string, string> = {
+      left: `${props.colOffset * props.cellW}px`,
+      width: `${props.span.text.length * props.cellW}px`,
+    };
     const fg = colorToCSS(props.span.fg, ansiPalette());
     const bg = colorToCSS(props.span.bg, ansiPalette());
 
@@ -86,16 +98,25 @@ const SpanElement: Component<SpanElementProps> = (props) => {
 
   const hasSelection = () => !!props.selectionRange;
   const hasSearchMatches = () => !!(props.searchMatches && props.searchMatches.length > 0);
+  const hasCursor = () => props.cursorCol !== undefined;
 
   const segments = createMemo(() => {
-    if (!hasSelection() && !hasSearchMatches()) return null;
+    if (!hasSelection() && !hasSearchMatches() && !hasCursor()) return null;
 
     const text = props.span.text;
     const row = props.row;
     const baseCol = props.colOffset;
 
-    type Highlight = { start: number; end: number; type: "selection" | "search" | "search-current" };
+    type Highlight = { start: number; end: number; type: "selection" | "search" | "search-current" | "cursor" };
     const highlights: Highlight[] = [];
+
+    // Block cursor: reverse the character at the cursor column
+    if (props.cursorCol !== undefined) {
+      const cursorLocal = props.cursorCol - baseCol;
+      if (cursorLocal >= 0 && cursorLocal < text.length) {
+        highlights.push({ start: cursorLocal, end: cursorLocal, type: "cursor" });
+      }
+    }
 
     if (props.selectionRange) {
       const norm = normalizeRange(props.selectionRange);
@@ -199,6 +220,11 @@ const SpanElement: Component<SpanElementProps> = (props) => {
           <For each={segs()}>
             {(seg) => {
               let cls = "";
+              // Only apply cursor-char color override when the cell has a default
+              // background. If the TUI styled this cell (non-default bg), it is
+              // managing its own appearance (e.g. rendering its own cursor via
+              // reverse video or explicit bg color) — don't interfere.
+              if (seg.highlights.has("cursor") && props.span.bg.type === "Default") cls += " term-cursor-char";
               if (seg.highlights.has("selection")) cls += " term-selected";
               if (seg.highlights.has("search")) cls += " term-search-match";
               if (seg.highlights.has("search-current")) cls += " term-search-current";

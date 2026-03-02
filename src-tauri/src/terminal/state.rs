@@ -58,6 +58,10 @@ pub struct TerminalState {
     image_protocol_drop_notified: bool,
     /// Last character passed through `print()`, used by CSI REP (`b`).
     last_printed_char: char,
+    /// Last cursor state emitted in a render snapshot. Used to detect
+    /// cursor-only changes (position, visibility, shape) that should
+    /// trigger a frame even when no grid lines are dirty.
+    last_emitted_cursor: (u16, u16, bool, CursorShape),
 }
 
 /// Snapshot of terminal render data extracted under lock.
@@ -131,6 +135,7 @@ impl TerminalState {
             experimental_image_protocols_enabled: image_protocols_enabled,
             image_protocol_drop_notified: false,
             last_printed_char: ' ',
+            last_emitted_cursor: (0, 0, true, CursorShape::Block),
         }
     }
 
@@ -219,9 +224,15 @@ impl TerminalState {
             self.bell_pending = false;
         }
 
-        if dirty_lines.is_empty() && all_events.is_empty() && scrolled_lines.is_empty() {
+        let cursor_visible = self.cursor.visible && self.modes.cursor_visible;
+        let current_cursor = (self.cursor.row, self.cursor.col, cursor_visible, self.cursor.shape);
+        let cursor_changed = current_cursor != self.last_emitted_cursor;
+
+        if dirty_lines.is_empty() && all_events.is_empty() && scrolled_lines.is_empty() && !cursor_changed {
             return None;
         }
+
+        self.last_emitted_cursor = current_cursor;
 
         let shape_str = match self.cursor.shape {
             CursorShape::Block => "block",

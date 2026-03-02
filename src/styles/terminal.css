@@ -131,6 +131,7 @@
 .terminal-content {
   position: relative;
   line-height: inherit;
+  overflow: hidden;
 }
 
 /* ---- Local input buffer ---- */
@@ -165,6 +166,8 @@
   line-height: inherit;
   height: 1lh;
   margin: 0;
+  position: relative;
+  z-index: 1;
   padding: 0;
   overflow: visible;
 }
@@ -172,6 +175,9 @@
 .term-span {
   white-space: pre;
   line-height: inherit;
+  height: 1lh;
+  position: absolute;
+  top: 0;
 }
 
 /* Nerd Font fallback chain */
@@ -211,6 +217,9 @@
   overflow: hidden;
   background: transparent;
   border-top: 1px solid var(--glass-border-soft);
+  /* Prevent TUI content from exceeding the scroll container's content width */
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 /* ---- Command blocks ---- */
@@ -400,6 +409,11 @@
 
 .cursor-blinking {
   animation: cursorBlink 1.06s step-end infinite;
+}
+
+/* Character under block cursor: rendered on top of the solid cursor block */
+.term-cursor-char {
+  color: var(--bg) !important;
 }
 
 /* ---- Welcome state ---- */
