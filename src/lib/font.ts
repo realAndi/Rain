@@ -84,7 +84,9 @@ export function measureFontMetrics(
     return cachedMetrics;
   }
 
-  const lineHeight = Math.ceil(fontSize * lineHeightMultiplier);
+  // Use exact pixel value — no rounding. Rounding up creates gaps between
+  // rows that break ASCII art and box-drawing character tiling.
+  const lineHeight = Math.round(fontSize * lineHeightMultiplier);
 
   // 1. Measure vertical metrics with canvas (uses original font).
   const canvas = document.createElement("canvas");
@@ -108,7 +110,7 @@ export function measureFontMetrics(
     `font-size: ${fontSize}px`,
     `line-height: ${lineHeight}px`,
     `letter-spacing: ${letterSpacing}px`,
-    `font-variant-ligatures: contextual`,
+    `font-variant-ligatures: none`,
     `font-variant-numeric: tabular-nums`,
     `font-kerning: none`,
     `text-rendering: optimizeSpeed`,
@@ -156,7 +158,7 @@ export function calculateTerminalSize(
   containerHeight: number,
   metrics: FontMetrics,
 ): { rows: number; cols: number } {
-  const cols = Math.floor(containerWidth / metrics.charWidth);
+  const cols = Math.floor(containerWidth / (metrics.charWidth + metrics.letterSpacing));
   const rows = Math.floor(containerHeight / metrics.lineHeight);
   return {
     rows: Math.max(1, rows),

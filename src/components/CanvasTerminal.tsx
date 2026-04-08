@@ -8,6 +8,7 @@ import type { TerminalStore } from "../stores/terminal";
 import { useConfig } from "../stores/config";
 import { useTheme, THEME_LIST, THEME_ANSI_PALETTES } from "../stores/theme";
 import { colorToCSS } from "../lib/color";
+import { measureFontMetrics } from "../lib/font";
 
 /**
  * Canvas-based terminal renderer component.
@@ -32,12 +33,15 @@ export const CanvasTerminal: Component<{
       return;
     }
     const cfg = config();
+    const met = measureFontMetrics(cfg.fontFamily, cfg.fontSize, cfg.lineHeight, cfg.letterSpacing);
     const themeEntry = THEME_LIST.find((t) => t.name === theme());
     const rendererConfig: CanvasRendererConfig = {
       fontFamily: cfg.fontFamily,
       fontSize: cfg.fontSize,
       lineHeight: cfg.lineHeight,
       letterSpacing: cfg.letterSpacing,
+      baseline: met.baseline,
+      domCharWidth: met.charWidth,
       cols: props.store.state.cols || 80,
       rows: props.store.state.rows || 24,
       devicePixelRatio: window.devicePixelRatio || 1,

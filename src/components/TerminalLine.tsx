@@ -30,7 +30,7 @@ export const TerminalLine: Component<TerminalLineProps> = (props) => {
           const colOffset = () => {
             let offset = 0;
             for (let i = 0; i < spanIdx(); i++) {
-              offset += props.line.spans[i].text.length;
+              offset += props.line.spans[i].cols;
             }
             return offset;
           };
@@ -69,10 +69,7 @@ const SpanElement: Component<SpanElementProps> = (props) => {
   const ansiPalette = createMemo(() => THEME_ANSI_PALETTES[theme()] ?? THEME_ANSI_PALETTES["dark"]);
 
   const style = () => {
-    const s: Record<string, string> = {
-      left: `${props.colOffset * props.cellW}px`,
-      width: `${props.span.text.length * props.cellW}px`,
-    };
+    const s: Record<string, string> = {};
     const fg = colorToCSS(props.span.fg, ansiPalette());
     const bg = colorToCSS(props.span.bg, ansiPalette());
 
@@ -87,7 +84,8 @@ const SpanElement: Component<SpanElementProps> = (props) => {
     if (props.span.italic) s["font-style"] = "italic";
 
     const decorations: string[] = [];
-    if (props.span.underline) decorations.push("underline");
+    // TODO: re-enable underline once SGR state management is fixed
+    // if (props.span.underline) decorations.push("underline");
     if (props.span.strikethrough) decorations.push("line-through");
     if (decorations.length > 0) {
       s["text-decoration"] = decorations.join(" ");

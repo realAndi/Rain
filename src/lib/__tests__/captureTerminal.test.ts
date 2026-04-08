@@ -13,13 +13,13 @@ import {
 } from "../captureTerminal";
 
 function line(text: string, index = 0): RenderedLine {
-  return { index, spans: [{ text, fg: { type: "Default" }, bg: { type: "Default" }, bold: false, dim: false, italic: false, underline: false, strikethrough: false }] };
+  return { index, spans: [{ text, cols: text.length, fg: { type: "Default" }, bg: { type: "Default" }, bold: false, dim: false, italic: false, underline: false, strikethrough: false }] };
 }
 
 function multiSpanLine(texts: string[], index = 0): RenderedLine {
   return {
     index,
-    spans: texts.map((text) => ({ text, fg: { type: "Default" } as const, bg: { type: "Default" } as const, bold: false, dim: false, italic: false, underline: false, strikethrough: false })),
+    spans: texts.map((text) => ({ text, cols: text.length, fg: { type: "Default" } as const, bg: { type: "Default" } as const, bold: false, dim: false, italic: false, underline: false, strikethrough: false })),
   };
 }
 

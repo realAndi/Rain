@@ -88,9 +88,9 @@ const defaultConfig: RainConfig = {
   statusBarShowActiveProcess: true,
   statusBarShowConnection: true,
   clearHistoryForTuis: false,
-  enableLigatures: true,
+  enableLigatures: false,
   globalHotkey: null,
-  renderer: "auto",
+  renderer: "dom",
 };
 
 function clampOpacity(value: number): number {

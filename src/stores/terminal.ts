@@ -294,8 +294,15 @@ export function createTerminalStore(): TerminalStore {
           }
         }
 
+        // When a frame carries an alt screen transition event, it fundamentally
+        // resets the rendering context. Accept its content regardless of
+        // epoch/seq staleness so the alt screen buffer is properly populated.
+        const hasAltTransition = frame.events.some(
+          (e) => e.type === "AltScreenEntered" || e.type === "AltScreenExited",
+        );
+
         const frameResizeEpoch = Math.max(0, frame.resize_epoch ?? 0);
-        if (frameResizeEpoch < s.currentResizeEpoch) {
+        if (frameResizeEpoch < s.currentResizeEpoch && !hasAltTransition) {
           if (frameDebug) {
             console.debug(
               `[Rain][frame] drop stale-epoch content sid=${payload.session_id.slice(0, 8)} frame_seq=${frame.frame_seq} frame_epoch=${frameResizeEpoch} current_epoch=${s.currentResizeEpoch} (events were applied)`,
@@ -307,7 +314,7 @@ export function createTerminalStore(): TerminalStore {
           s.currentResizeEpoch = frameResizeEpoch;
         }
 
-        if (frame.frame_seq <= s.lastFrameSeq) {
+        if (frame.frame_seq <= s.lastFrameSeq && !hasAltTransition) {
           if (frameDebug) {
             console.debug(
               `[Rain][frame] drop stale-seq content sid=${payload.session_id.slice(0, 8)} frame_seq=${frame.frame_seq} last_seq=${s.lastFrameSeq} epoch=${frameResizeEpoch} (events were applied)`,
@@ -315,7 +322,7 @@ export function createTerminalStore(): TerminalStore {
           }
           return;
         }
-        s.lastFrameSeq = frame.frame_seq;
+        s.lastFrameSeq = Math.max(s.lastFrameSeq, frame.frame_seq);
 
         const prevRows = s.rows;
         const prevCols = s.cols;
@@ -459,8 +466,8 @@ export function createTerminalStore(): TerminalStore {
           return;
         }
 
-        if (s.altScreen) {
-          s.altScreenLines = [];
+        if (s.altScreen && shrinking) {
+          trimBufferToRows(s.altScreenLines, ackRows);
         }
 
         if (shrinking) {

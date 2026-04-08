@@ -262,6 +262,7 @@ const App: Component = () => {
         index: line.index,
         spans: line.spans.map((span) => ({
           text: span.text,
+          cols: (span as any).cols ?? span.text.length,
           fg: span.fg as SerializableColor,
           bg: span.bg as SerializableColor,
           bold: span.bold,

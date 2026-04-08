@@ -169,15 +169,12 @@
   position: relative;
   z-index: 1;
   padding: 0;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .term-span {
-  white-space: pre;
-  line-height: inherit;
-  height: 1lh;
-  position: absolute;
-  top: 0;
+  display: inline;
+  text-decoration: none;
 }
 
 /* Nerd Font fallback chain */
@@ -188,13 +185,13 @@
 .active-viewport,
 .block-output,
 .traditional-block {
-  font-variant-ligatures: contextual;
-  -webkit-font-variant-ligatures: contextual;
-}
-
-[data-ligatures="false"] .term-span {
   font-variant-ligatures: none;
   -webkit-font-variant-ligatures: none;
+}
+
+[data-ligatures="true"] .term-span {
+  font-variant-ligatures: contextual;
+  -webkit-font-variant-ligatures: contextual;
 }
 
 /* ---- Alt screen ---- */
@@ -803,7 +800,6 @@
 
 /* Canvas terminal renderer */
 .canvas-terminal {
-  image-rendering: pixelated;
   -webkit-font-smoothing: antialiased;
   max-width: 100%;
 }

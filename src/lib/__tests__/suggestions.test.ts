@@ -17,6 +17,7 @@ function makeLine(index: number, text: string): RenderedLine {
     spans: [
       {
         text,
+        cols: text.length,
         fg: { type: "Default" },
         bg: { type: "Default" },
         bold: false,

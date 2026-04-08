@@ -3,6 +3,9 @@ export interface CanvasRendererConfig {
   fontSize: number;
   lineHeight: number;
   letterSpacing: number;
+  baseline: number;
+  /** DOM-measured character width — use this instead of canvas measureText for grid alignment */
+  domCharWidth?: number;
   cols: number;
   rows: number;
   devicePixelRatio: number;
@@ -181,7 +184,7 @@ export class CanvasTerminalRenderer {
 
   constructor(canvas: HTMLCanvasElement, config: CanvasRendererConfig) {
     this.canvas = canvas;
-    const context = canvas.getContext("2d", { alpha: false });
+    const context = canvas.getContext("2d", { alpha: true });
     if (!context) {
       throw new Error("Canvas 2D context unavailable");
     }
@@ -195,8 +198,14 @@ export class CanvasTerminalRenderer {
     const dpr = Math.max(1, this.config.devicePixelRatio || 1);
     this.config.devicePixelRatio = dpr;
     this.ctx.font = this.buildFont(false, false);
-    const metrics = this.ctx.measureText("M");
-    this.charWidth = Math.ceil(metrics.width + this.config.letterSpacing);
+    // Use DOM-measured charWidth when available for pixel-perfect alignment
+    // with the DOM renderer. Fall back to canvas measurement otherwise.
+    if (this.config.domCharWidth != null && this.config.domCharWidth > 0) {
+      this.charWidth = Math.round(this.config.domCharWidth);
+    } else {
+      const metrics = this.ctx.measureText("M");
+      this.charWidth = Math.round(metrics.width + this.config.letterSpacing);
+    }
     this.charHeight = Math.ceil(this.config.fontSize * this.config.lineHeight);
 
     const width = Math.max(1, this.charWidth * this.config.cols);
@@ -351,14 +360,14 @@ export class CanvasTerminalRenderer {
     const cw = this.charWidth;
     const ch = this.charHeight;
     const dpr = this.config.devicePixelRatio;
-    const baselineOffset = this.config.fontSize * 0.85;
+    const baselineOffset = this.config.baseline;
     const cache = this.glyphCache;
 
     if (this.fullDirty) {
       this.fullDirty = false;
       this.dirtyRows.clear();
-      ctx.fillStyle = this.config.defaultBg;
-      ctx.fillRect(0, 0, this.viewportWidth, this.viewportHeight);
+      // Clear to transparent so Rain's glass background shows through
+      ctx.clearRect(0, 0, this.viewportWidth, this.viewportHeight);
       for (let r = 0; r < this.config.rows; r++) {
         this.renderRow(r, ctx, cw, ch, dpr, baselineOffset, cache);
       }
@@ -366,8 +375,7 @@ export class CanvasTerminalRenderer {
       const rows = this.dirtyRows;
       this.dirtyRows = new Set();
       for (const r of rows) {
-        ctx.fillStyle = this.config.defaultBg;
-        ctx.fillRect(0, r * ch, this.viewportWidth, ch);
+        ctx.clearRect(0, r * ch, this.viewportWidth, ch);
         this.renderRow(r, ctx, cw, ch, dpr, baselineOffset, cache);
       }
     }
@@ -414,7 +422,7 @@ export class CanvasTerminalRenderer {
             atlasCtx.font = this.buildFont(cell.bold, cell.italic);
             atlasCtx.fillStyle = cell.dim ? this.dimColor(cell.fg) : cell.fg;
             atlasCtx.textBaseline = "alphabetic";
-            const atlasBaseline = this.config.fontSize * 0.85 * dpr;
+            const atlasBaseline = this.config.baseline * dpr;
             atlasCtx.fillText(cell.char, ax, ay + atlasBaseline);
           });
         }

@@ -32,19 +32,16 @@ export const Cursor: Component<{
       left = `${props.leftPx}px`;
       top = `${props.topPx}px`;
     } else if (cw !== undefined) {
-      // Pixel-precise: col * (charWidth + letterSpacing)
-      // charWidth already includes the font's advance; letterSpacing
-      // is added per-character by the browser's text layout engine.
-      left = `${col * (cw + ls)}px`;
+      // Use ch units for horizontal positioning so cursor aligns with
+      // inline-block spans that also use ch units for width.
+      left = ls !== 0 ? `calc(${col}ch + ${col * ls}px)` : `${col}ch`;
       top = lh !== undefined ? `${row * lh}px` : `calc(${row} * 1lh)`;
     } else {
-      // Fallback to ch units
-      const spacingOffset = col * ls;
-      left = spacingOffset !== 0 ? `calc(${col}ch + ${spacingOffset}px)` : `${col}ch`;
+      left = `${col}ch`;
       top = `calc(${row} * 1lh)`;
     }
 
-    width = cw !== undefined ? `${cw}px` : "1ch";
+    width = "1ch";
     height = lh !== undefined ? `${lh}px` : "1lh";
 
     const base: Record<string, string> = {
@@ -53,20 +50,23 @@ export const Cursor: Component<{
       top,
       width,
       height,
+      "z-index": "2",
       "pointer-events": "none",
     };
 
     // Use display:none when hidden so CSS blink animation can't override it
-    if (!props.cursor.visible) {
-      base.display = "none";
-    }
+    // TODO: re-enable after debugging cursor visibility in TUI apps
+    // if (!props.cursor.visible) {
+    //   base.display = "none";
+    // }
 
     switch (props.cursor.shape) {
       case "block":
-        // Render behind the text (z-index:0) so the character is visible
-        // on top of the solid cursor block. Term-lines have z-index:1.
-        base["z-index"] = "0";
+        // Block cursor renders behind text but above the line background.
+        // Use mix-blend-mode so the character glyph remains readable.
+        base["z-index"] = "2";
         base["background-color"] = "var(--cursor-color)";
+        base["mix-blend-mode"] = "difference";
         break;
       case "underline":
         // Underline/bar render above text so they're always visible

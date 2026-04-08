@@ -361,9 +361,11 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
 
     // Re-measure when alt screen changes — the scrollbar state may differ
     // between normal shell and inline TUI, affecting available content width.
+    // Use a small delay to let the alt screen frame pipeline settle before
+    // triggering a resize that would increment the epoch and drop in-flight frames.
     createEffect(() => {
       const _altScreen = props.store.state.altScreen;
-      requestAnimationFrame(measure);
+      setTimeout(() => requestAnimationFrame(measure), 100);
     });
 
     onCleanup(() => {
@@ -1125,26 +1127,35 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     const adj = met.adjustedFontFamily;
     const orig = met.fontFamily;
     if (adj && adj !== orig) {
-      return `"${adj}", "${orig}", monospace`;
+      return `"${adj}", "${orig}", "Rain Symbols Fallback", monospace`;
     }
-    return `"${orig}", monospace`;
+    return `"${orig}", "Rain Symbols Fallback", monospace`;
   };
   const fontSize = () => m()?.fontSize ?? 14;
   const charWidth = () => m()?.charWidth ?? 8;
 
-  const useCanvasViewport = () => config().renderer !== "dom" && canUseCanvasRenderer();
+  // Force DOM renderer — canvas/WebGL breaks Rain's glass transparency
+  // and has font metric mismatches. TODO: revisit when canvas alpha is polished.
+  const useCanvasViewport = () => false;
   let activeCanvasRef: HTMLCanvasElement | undefined;
+  const [canvasEl, setCanvasEl] = createSignal<HTMLCanvasElement | undefined>();
   let activeCanvasRenderer: CanvasTerminalRenderer | WebGLTerminalRenderer | null = null;
+  let activeCanvasRendererEl: HTMLCanvasElement | undefined;
 
   function ensureCanvasRenderer(canvas: HTMLCanvasElement) {
-    if (activeCanvasRenderer) return activeCanvasRenderer;
+    if (activeCanvasRenderer && activeCanvasRendererEl === canvas) return activeCanvasRenderer;
+    // Canvas element changed (e.g. switching between inline TUI and active viewport) — rebuild
+    if (activeCanvasRenderer) destroyCanvasRenderer();
     const cfg = config();
     const themeEntry = THEME_LIST.find((t) => t.name === theme());
+    const met = metrics();
     const rendererConfig: CanvasRendererConfig = {
       fontFamily: cfg.fontFamily,
       fontSize: cfg.fontSize,
       lineHeight: cfg.lineHeight,
       letterSpacing: cfg.letterSpacing,
+      baseline: met?.baseline ?? cfg.fontSize * 0.85,
+      domCharWidth: met?.charWidth,
       cols: props.store.state.cols || 80,
       rows: props.store.state.rows || 24,
       devicePixelRatio: window.devicePixelRatio || 1,
@@ -1156,6 +1167,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     if (rendererPref !== "canvas" && canUseWebGLRenderer()) {
       try {
         activeCanvasRenderer = new WebGLTerminalRenderer(canvas, rendererConfig);
+        activeCanvasRendererEl = canvas;
         activeCanvasRenderer.startRenderLoop();
         return activeCanvasRenderer;
       } catch {
@@ -1164,6 +1176,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     }
 
     activeCanvasRenderer = new CanvasTerminalRenderer(canvas, rendererConfig);
+    activeCanvasRendererEl = canvas;
     activeCanvasRenderer.startRenderLoop();
     return activeCanvasRenderer;
   }
@@ -1172,6 +1185,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
     if (activeCanvasRenderer) {
       activeCanvasRenderer.destroy();
       activeCanvasRenderer = null;
+      activeCanvasRendererEl = undefined;
     }
   }
 
@@ -1180,14 +1194,20 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
       destroyCanvasRenderer();
       return;
     }
-    if (!activeCanvasRef) return;
-    const renderer = ensureCanvasRenderer(activeCanvasRef);
+    // Track the reactive canvas element signal so this effect re-runs
+    // when <Show> conditionally mounts/unmounts the canvas.
+    const canvas = canvasEl();
+    if (!canvas) return;
+    const renderer = ensureCanvasRenderer(canvas);
     const rows = props.store.state.rows || 24;
     const cols = props.store.state.cols || 80;
     renderer.resize(cols, rows);
   });
 
   createEffect(() => {
+    // Track canvasEl() so this effect re-runs when the canvas element
+    // is mounted/unmounted (which correlates with renderer creation).
+    const _canvas = canvasEl();
     if (!useCanvasViewport() || !activeCanvasRenderer) return;
 
     let lines: RenderedLine[];
@@ -2011,48 +2031,40 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
           tmux running in compatibility mode (use Rain's native integration with Cmd+Shift+T)
         </div>
       </Show>
-      {/* Fullscreen TUI: absolute overlay when setting is enabled */}
+      {/* Fullscreen TUI: absolute overlay when setting is enabled.
+           Always uses DOM rendering — canvas would be opaque and break
+           Rain's transparency/glass aesthetic. */}
       <Show when={fullscreenTui()}>
-        <Show when={useCanvasViewport()} fallback={
-          <div class="alt-screen">
-            <div class="terminal-content" style={{ position: "relative" }}>
-              <For each={buildFullGrid(props.store.state.altScreenLines, props.store.state.rows)}>
-                {(line) => (
-                  <TerminalLine
-                    line={line}
-                    charWidth={charWidth()}
-                    letterSpacing={config().letterSpacing}
-                    selectionRange={selection().range}
-                    searchMatches={props.store.state.searchMatches}
-                    searchCurrentIndex={props.store.state.searchCurrentIndex}
-                    cursorCol={
-                      props.store.state.cursor.visible &&
-                      props.store.state.cursor.shape === "block" &&
-                      line.index === props.store.state.cursor.row
-                        ? props.store.state.cursor.col
-                        : undefined
-                    }
-                  />
-                )}
-              </For>
-              <Cursor
-                cursor={props.store.state.cursor}
-                charWidth={charWidth()}
-                lineHeight={lineHeight()}
-                letterSpacing={config().letterSpacing}
-                blinking={config().cursorBlink}
-              />
-            </div>
-          </div>
-        }>
-          <div class="alt-screen">
-            <canvas
-              ref={activeCanvasRef}
-              class="canvas-terminal"
-              style={{ display: "block", width: "100%", height: "100%" }}
+        <div class="alt-screen">
+          <div class="terminal-content" style={{ position: "relative" }}>
+            <For each={buildFullGrid(props.store.state.altScreenLines, props.store.state.rows)}>
+              {(line) => (
+                <TerminalLine
+                  line={line}
+                  charWidth={charWidth()}
+                  letterSpacing={config().letterSpacing}
+                  selectionRange={selection().range}
+                  searchMatches={props.store.state.searchMatches}
+                  searchCurrentIndex={props.store.state.searchCurrentIndex}
+                  cursorCol={
+                    props.store.state.cursor.visible &&
+                    props.store.state.cursor.shape === "block" &&
+                    line.index === props.store.state.cursor.row
+                      ? props.store.state.cursor.col
+                      : undefined
+                  }
+                />
+              )}
+            </For>
+            <Cursor
+              cursor={props.store.state.cursor}
+              charWidth={charWidth()}
+              lineHeight={lineHeight()}
+              letterSpacing={config().letterSpacing}
+              blinking={config().cursorBlink}
             />
           </div>
-        </Show>
+        </div>
       </Show>
 
       <Show when={!fullscreenTui()}>
@@ -2147,7 +2159,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   </div>
                 }>
                   <canvas
-                    ref={activeCanvasRef}
+                    ref={(el) => { activeCanvasRef = el; setCanvasEl(el); }}
                     class="canvas-terminal active-output"
                     style={{ display: "block", width: "100%", "min-height": `${(props.store.state.rows || 24) * lineHeight()}px` }}
                   />
@@ -2255,9 +2267,9 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
             </div>
           </Show>
 
-          {/* Inline TUI viewport: alt-screen content rendered in document flow */}
+          {/* Inline TUI viewport: alt-screen content rendered in document flow.
+               Always uses DOM rendering for transparency. */}
           <Show when={inlineTui()}>
-            <Show when={useCanvasViewport()} fallback={
               <div class="alt-screen-inline">
                 <div class="terminal-content" style={{ position: "relative" }}>
                   <For each={buildFullGrid(props.store.state.altScreenLines, props.store.state.rows)}>
@@ -2288,15 +2300,6 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
                   />
                 </div>
               </div>
-            }>
-              <div class="alt-screen-inline">
-                <canvas
-                  ref={activeCanvasRef}
-                  class="canvas-terminal"
-                  style={{ display: "block", width: "100%", "min-height": `${(props.store.state.rows || 24) * lineHeight()}px` }}
-                />
-              </div>
-            </Show>
           </Show>
 
           {/* Active command: render full viewport lines inline (not during inline TUI) */}
@@ -2332,7 +2335,7 @@ export const Terminal: Component<{ store: TerminalStore; active: boolean; isTabA
               </div>
             }>
               <canvas
-                ref={activeCanvasRef}
+                ref={(el) => { activeCanvasRef = el; setCanvasEl(el); }}
                 class="canvas-terminal active-viewport"
                 style={{ display: "block", width: "100%", "min-height": `${(props.store.state.rows || 24) * lineHeight()}px` }}
               />

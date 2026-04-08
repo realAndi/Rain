@@ -486,6 +486,11 @@ impl TerminalState {
             self.alt_grid = Some(Grid::new(self.rows, self.cols));
             self.using_alt = true;
             self.modes.alt_screen = true;
+            // Reset cursor attributes to defaults (matching xterm/iTerm2/kitty).
+            // TUI apps expect a clean attribute state in alt screen.
+            self.cursor.attrs = CellAttrs::empty();
+            self.cursor.fg = Color::Default;
+            self.cursor.bg = Color::Default;
             self.pending_terminal_events
                 .push(TerminalEvent::AltScreenEntered);
         }
@@ -595,6 +600,75 @@ impl TerminalState {
             }
             i += 1;
         }
+    }
+
+    /// Process SGR with sub-parameter awareness.
+    /// Semicolon-separated params (e.g. `38;2;r;g;b`) come as separate single-value
+    /// groups and are flattened for the existing `handle_sgr`.
+    /// Colon-separated sub-params (e.g. `4:0`, `38:2:r:g:b`) come as multi-value
+    /// groups and are handled specially to avoid misinterpretation.
+    fn handle_sgr_params(&mut self, params: &vte::Params) {
+        if params.len() == 0 {
+            self.handle_sgr(&[0]);
+            return;
+        }
+
+
+        let mut flat: Vec<u16> = Vec::new();
+
+        for subparams in params.iter() {
+            let sub: Vec<u16> = subparams.iter().copied().collect();
+            if sub.is_empty() {
+                continue;
+            }
+
+            if sub.len() > 1 {
+                // Colon-separated sub-params — flush pending flat params first,
+                // then handle this group specially.
+                if !flat.is_empty() {
+                    self.handle_sgr(&flat);
+                    flat.clear();
+                }
+                match sub[0] {
+                    4 => match sub.get(1).copied().unwrap_or(1) {
+                        0 => self.cursor.attrs.remove(CellAttrs::UNDERLINE),
+                        _ => self.cursor.attrs.insert(CellAttrs::UNDERLINE),
+                    },
+                    38 => match sub.get(1).copied().unwrap_or(0) {
+                        2 if sub.len() >= 5 => {
+                            self.cursor.fg =
+                                Color::Rgb(sub[2] as u8, sub[3] as u8, sub[4] as u8);
+                        }
+                        5 if sub.len() >= 3 => {
+                            self.cursor.fg = Color::Indexed(sub[2] as u8);
+                        }
+                        _ => {}
+                    },
+                    48 => match sub.get(1).copied().unwrap_or(0) {
+                        2 if sub.len() >= 5 => {
+                            self.cursor.bg =
+                                Color::Rgb(sub[2] as u8, sub[3] as u8, sub[4] as u8);
+                        }
+                        5 if sub.len() >= 3 => {
+                            self.cursor.bg = Color::Indexed(sub[2] as u8);
+                        }
+                        _ => {}
+                    },
+                    other => {
+                        // Unknown colon sub-params — use just the primary value
+                        flat.push(other);
+                    }
+                }
+            } else {
+                // Single-value group (semicolon-separated) — collect for flat processing
+                flat.push(sub[0]);
+            }
+        }
+
+        if !flat.is_empty() {
+            self.handle_sgr(&flat);
+        }
+
     }
 
     fn emit_mode_changed(&mut self) {
@@ -810,6 +884,11 @@ impl TerminalState {
                         "A" => {
                             let row = self.global_row();
                             self.shell.prompt_start(row);
+                            // Reset cursor attributes at prompt start so stale
+                            // SGR state from a previous command doesn't leak.
+                            self.cursor.attrs = CellAttrs::empty();
+                            self.cursor.fg = Color::Default;
+                            self.cursor.bg = Color::Default;
                         }
                         "B" => {
                             let cmd: String = params[2..]
@@ -1362,7 +1441,7 @@ impl vte::Perform for TerminalState {
                     self.cursor.row = row.min(self.rows.saturating_sub(1));
                 }
             }
-            ('m', false) => self.handle_sgr(&raw),
+            ('m', false) => self.handle_sgr_params(params),
             ('r', false) => {
                 let top = param(&raw, 0, 1).saturating_sub(1);
                 let bottom = param(&raw, 1, self.rows).saturating_sub(1);

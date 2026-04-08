@@ -117,6 +117,7 @@ impl Row {
 
         let mut spans = Vec::new();
         let mut text = String::new();
+        let mut cur_cols: u32 = 0;
         let mut cur_fg = Color::Default;
         let mut cur_bg = Color::Default;
         let mut cur_attrs = CellAttrs::empty();
@@ -137,8 +138,9 @@ impl Row {
             } else if cell.fg != cur_fg || cell.bg != cur_bg || cell.attrs != cur_attrs {
                 // Style changed, flush current span
                 if !text.is_empty() {
-                    spans.push(StyledSpan::new(&text, cur_fg, cur_bg, cur_attrs));
+                    spans.push(StyledSpan::new(&text, cur_cols, cur_fg, cur_bg, cur_attrs));
                     text.clear();
+                    cur_cols = 0;
                 }
                 cur_fg = cell.fg;
                 cur_bg = cell.bg;
@@ -146,10 +148,15 @@ impl Row {
             }
 
             text.push(cell.c);
+            if cell.flags.contains(CellFlags::WIDE_CHAR) {
+                cur_cols += 2;
+            } else {
+                cur_cols += 1;
+            }
         }
 
         if !text.is_empty() {
-            spans.push(StyledSpan::new(&text, cur_fg, cur_bg, cur_attrs));
+            spans.push(StyledSpan::new(&text, cur_cols, cur_fg, cur_bg, cur_attrs));
         }
 
         spans

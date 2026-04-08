@@ -3,11 +3,11 @@ import { trimTrailingEmpty, collectLinesForRange } from "../terminal-output";
 import type { RenderedLine } from "../types";
 
 function line(text: string, index = 0): RenderedLine {
-  return { index, spans: [{ text, fg: { type: "Default" }, bg: { type: "Default" }, bold: false, dim: false, italic: false, underline: false, strikethrough: false }] };
+  return { index, spans: [{ text, cols: text.length, fg: { type: "Default" }, bg: { type: "Default" }, bold: false, dim: false, italic: false, underline: false, strikethrough: false }] };
 }
 
 function emptyLine(index = 0): RenderedLine {
-  return { index, spans: [{ text: "   ", fg: { type: "Default" }, bg: { type: "Default" }, bold: false, dim: false, italic: false, underline: false, strikethrough: false }] };
+  return { index, spans: [{ text: "   ", cols: 3, fg: { type: "Default" }, bg: { type: "Default" }, bold: false, dim: false, italic: false, underline: false, strikethrough: false }] };
 }
 
 describe("trimTrailingEmpty", () => {

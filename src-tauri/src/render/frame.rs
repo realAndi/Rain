@@ -41,6 +41,7 @@ pub struct RenderedLine {
 #[derive(Debug, Clone, Serialize)]
 pub struct StyledSpan {
     pub text: String,
+    pub cols: u32,
     pub fg: SerializableColor,
     pub bg: SerializableColor,
     pub bold: bool,
@@ -53,7 +54,7 @@ pub struct StyledSpan {
 }
 
 impl StyledSpan {
-    pub fn new(text: &str, fg: Color, bg: Color, attrs: CellAttrs) -> Self {
+    pub fn new(text: &str, cols: u32, fg: Color, bg: Color, attrs: CellAttrs) -> Self {
         // SGR 7 (REVERSE): swap foreground and background colors
         let (fg, bg) = if attrs.contains(CellAttrs::REVERSE) {
             (bg, fg)
@@ -70,6 +71,7 @@ impl StyledSpan {
 
         Self {
             text: text.to_string(),
+            cols,
             fg: fg.into(),
             bg: bg.into(),
             bold: attrs.contains(CellAttrs::BOLD),

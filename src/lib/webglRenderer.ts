@@ -257,6 +257,7 @@ class WebGLGlyphAtlas {
     dpr: number,
     fontFamily: string,
     fontSize: number,
+    baseline: number,
   ) {
     this.gl = gl;
     this.dpr = Math.max(1, dpr || 1);
@@ -267,7 +268,7 @@ class WebGLGlyphAtlas {
     this.atlasWidth = this.cellWidth * GLYPH_ATLAS_COLUMNS;
     this.atlasRows = GLYPH_ATLAS_INITIAL_ROWS;
     this.atlasHeight = this.cellHeight * this.atlasRows;
-    this.baselinePx = this.fontSize * 0.85 * this.dpr;
+    this.baselinePx = baseline * this.dpr;
 
     const { canvas, ctx } = createAtlasSurface(this.atlasWidth, this.atlasHeight);
     this.atlas = canvas;
@@ -511,9 +512,9 @@ export class WebGLTerminalRenderer {
     this.config = { ...config };
 
     const gl = canvas.getContext("webgl2", {
-      alpha: false,
+      alpha: true,
       antialias: false,
-      premultipliedAlpha: false,
+      premultipliedAlpha: true,
       preserveDrawingBuffer: false,
     });
     if (!gl) throw new Error("WebGL2 unavailable");
@@ -826,6 +827,7 @@ export class WebGLTerminalRenderer {
       this.config.devicePixelRatio,
       this.config.fontFamily,
       this.config.fontSize,
+      this.config.baseline,
     );
   }
 
@@ -833,11 +835,16 @@ export class WebGLTerminalRenderer {
     const dpr = Math.max(1, this.config.devicePixelRatio || 1);
     this.config.devicePixelRatio = dpr;
 
-    const measureCanvas = document.createElement("canvas");
-    const measureCtx = measureCanvas.getContext("2d")!;
-    measureCtx.font = this.buildFont(false, false);
-    const metrics = measureCtx.measureText("M");
-    this.charWidth = Math.ceil(metrics.width + this.config.letterSpacing);
+    // Use DOM-measured charWidth when available for pixel-perfect alignment
+    if (this.config.domCharWidth != null && this.config.domCharWidth > 0) {
+      this.charWidth = Math.round(this.config.domCharWidth);
+    } else {
+      const measureCanvas = document.createElement("canvas");
+      const measureCtx = measureCanvas.getContext("2d")!;
+      measureCtx.font = this.buildFont(false, false);
+      const metrics = measureCtx.measureText("M");
+      this.charWidth = Math.round(metrics.width + this.config.letterSpacing);
+    }
     this.charHeight = Math.ceil(this.config.fontSize * this.config.lineHeight);
 
     const width = Math.max(1, this.charWidth * this.config.cols);
@@ -1016,8 +1023,8 @@ export class WebGLTerminalRenderer {
     if (!this.fullDirty && this.dirtyRows.size === 0 && !this.overlayDirty) return;
 
     const gl = this.gl;
-    const [clearR, clearG, clearB, clearA] = this.defaultBgColor;
-    gl.clearColor(clearR, clearG, clearB, clearA);
+    // Clear to transparent so Rain's glass background shows through
+    gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     const rows = this.config.rows;
     const cols = this.config.cols;

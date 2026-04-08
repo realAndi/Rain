@@ -244,6 +244,7 @@ export const TabBar: Component<{
           index: line.index,
           spans: line.spans.map((span) => ({
             text: span.text,
+            cols: span.cols ?? span.text.length,
             fg: span.fg as SerializableColor,
             bg: span.bg as SerializableColor,
             bold: span.bold,
@@ -553,6 +554,7 @@ export const TabBar: Component<{
         index: line.index,
         spans: line.spans.map((span) => ({
           text: span.text,
+          cols: (span as any).cols ?? span.text.length,
           fg: span.fg as SerializableColor,
           bg: span.bg as SerializableColor,
           bold: span.bold,

@@ -24,6 +24,7 @@ export interface RenderedLine {
 
 export interface StyledSpan {
   text: string;
+  cols: number;
   fg: SerializableColor;
   bg: SerializableColor;
   bold: boolean;
